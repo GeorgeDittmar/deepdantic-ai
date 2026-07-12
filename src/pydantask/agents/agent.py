@@ -100,6 +100,7 @@ CheckpointEventType = Literal[
     "final_task_set",
 ]
 
+
 class DeepAgent:
     """Pydantic AI based DeepAgent that manages sub-agents to achieve complex goals."""
 
@@ -206,9 +207,7 @@ class DeepAgent:
         # - `resume=True` requires `checkpoint_dir` and will replay
         #   events from that directory on `run()`.
         if resume and checkpoint_dir is None:
-            raise ValueError(
-                "checkpoint_dir must be provided when resume=True"
-            )
+            raise ValueError("checkpoint_dir must be provided when resume=True")
 
         if checkpoint_dir is not None or checkpoint:
             checkpoint = True
@@ -261,7 +260,7 @@ class DeepAgent:
         # TODO: rework some of these tools
         tavily_api_key = os.getenv("TAVILY_API_KEY", None)
 
-        _defautl_research_tool_set = [
+        _default_research_tool_set = [
             think_tool,
             append_scratch_note,
             read_scratch_notes,
@@ -275,15 +274,15 @@ class DeepAgent:
             logger.info(
                 "Tavily api key not found. Defaulting to built in Duck Duck Go search tool."
             )
-            _defautl_research_tool_set.append(duckduckgo_search_tool())
+            _default_research_tool_set.append(duckduckgo_search_tool())
         else:
-            _defautl_research_tool_set.append(tavily_search_tool(tavily_api_key))
+            _default_research_tool_set.append(tavily_search_tool(tavily_api_key))
 
         self._researcher_agent = researcher_agent or Agent(
             model=self._retry_model,
             name="_default_Research_Agent",
             system_prompt=RESEARCH_AGENT_SYS_PROMPT,
-            tools=_defautl_research_tool_set,
+            tools=_default_research_tool_set,
             deps_type=TaskRunDeps,
             output_type=TaskResult,
         )
@@ -415,7 +414,7 @@ class DeepAgent:
                     fallback_strategy=wait_exponential(multiplier=1, max=60),
                     max_wait=300,
                 ),
-                #TODO: make this configurable
+                # TODO: make this configurable
                 stop=stop_after_attempt(3),
                 # Re-raise the last exception if all retries fail
                 reraise=True,
@@ -731,7 +730,7 @@ class DeepAgent:
         relpath = f"{TASK_RESULT_ARTIFACT_DIRNAME}/task_{task_id}.json"
         path = self.checkpoint_path / relpath
         with path.open("w", encoding="utf-8") as fh:
-            await asyncio.to_thread(json.dump,result_payload, fh, ensure_ascii=False)
+            await asyncio.to_thread(json.dump, result_payload, fh, ensure_ascii=False)
 
         return relpath
 
@@ -1690,7 +1689,7 @@ Instructions:
                     # Treat this as a no-progress cycle so we eventually fail-safe.
                     no_progress_cycles += 1
                     if self.checkpoint:
-                       await self._checkpoint_state(runtime_state)
+                        await self._checkpoint_state(runtime_state)
                     runtime_state.runtime_steps += 1
                     step_count += 1
                     continue
@@ -2082,7 +2081,9 @@ Context-budget note:
                 step.status = TaskStatus.NEEDS_REVIEW
                 step.error_msg = None
                 await self._record_task_result(step)
-                await self._record_task_status_event(step.task_id, TaskStatus.NEEDS_REVIEW)
+                await self._record_task_status_event(
+                    step.task_id, TaskStatus.NEEDS_REVIEW
+                )
                 return step
             except Exception as e:
                 last_error = e

@@ -1,6 +1,6 @@
 [project]
 name = "pydantask"
-version = "0.1.0a4"
+version = "0.1.0a6"
 description = "A hierarchical multi-agent Deep Agent harness built on Pydantic AI"
 readme = "README.md"
 requires-python = ">=3.12" 
