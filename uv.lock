@@ -2356,7 +2356,7 @@ wheels = [
 
 [[package]]
 name = "pydantask"
-version = "0.1.0a2"
+version = "0.1.0a6"
 source = { editable = "." }
 dependencies = [
     { name = "aiofiles" },
@@ -2370,7 +2370,7 @@ dependencies = [
     { name = "mkdocstrings-python" },
     { name = "pydantic" },
     { name = "pydantic-ai" },
-    { name = "pydantic-ai-slim", extra = ["duckduckgo"] },
+    { name = "pydantic-ai-slim", extra = ["anthropic", "duckduckgo"] },
     { name = "pydantic-graph" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -2407,7 +2407,7 @@ requires-dist = [
     { name = "mkdocstrings-python", specifier = ">=2.0.3" },
     { name = "pydantic", specifier = ">=2.12.5" },
     { name = "pydantic-ai", specifier = ">=1.48.0" },
-    { name = "pydantic-ai-slim", extras = ["duckduckgo"], specifier = ">=1.75.0" },
+    { name = "pydantic-ai-slim", extras = ["anthropic", "duckduckgo"], specifier = ">=1.75.0" },
     { name = "pydantic-graph", specifier = ">=1.32.0" },
     { name = "pytest", specifier = ">=9.0.3" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.2" },

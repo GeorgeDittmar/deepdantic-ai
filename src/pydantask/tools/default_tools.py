@@ -4,7 +4,7 @@ from pathlib import Path
 import ipaddress
 import socket
 from urllib.parse import urlparse
-
+import asyncio
 import httpx
 from loguru import logger
 from pydantic_ai import RunContext
@@ -49,7 +49,7 @@ def _get_runtime_state(deps: RuntimeState | TaskRunDeps) -> RuntimeState:
 
 async def ask_user(ctx: RunContext[RuntimeState], question_for_user: str) -> str:
     """Prompt the user for input. This is a synchronous blocking call."""
-    return input(f"{question_for_user}: ")
+    return await asyncio.to_thread(input, f"{question_for_user}: ")
 
 
 async def think_tool(reflection: str) -> str:
@@ -72,7 +72,7 @@ async def think_tool(reflection: str) -> str:
     Returns:
         Confirmation that reflection was recorded for decision-making
     """
-    return f"Reflection recorded: {reflection}"
+    return f"{reflection}"
 
 
 async def write_to_file_system(

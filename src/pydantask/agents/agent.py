@@ -43,6 +43,11 @@ from pydantask.prompts.prompts_v2 import (
     DYNAMIC_SUPERVISOR_SYS_PROMPT,
     BOOTSTRAP_INSTURCT,
     ORCHESTRATION_INSTRUCT,
+    COMPRESSED_RESEARCH_SYS_PROMPT,
+    COMPRESSED_SUPER_PROMPT,
+    COMPRESSED_CRITIC_SYS_PROMPT,
+    COMPRESSED_WORKER_SYS_PROMPT,
+    COMPRESSED_PRODUCER_SYS_PROMPT
 )
 
 from pydantask.models import (
@@ -114,6 +119,7 @@ class DeepAgent:
         supervisor_agent: Optional[Agent] = None,
         researcher_agent: Optional[Agent] = None,
         max_steps: int = 20,
+        max_steps_no_progress: int = 5,
         set_token_budget: Union[int, None] = None,
         sub_agents: Union[None, list[CapabilityDescription]] = None,
         # default output type for the producer agent, can be set to a default type or custom pydantic model for better structure and validation of final output
@@ -131,24 +137,6 @@ class DeepAgent:
             objective: The overall objective / task the deep agent is working on.
             model: Model identifier or ``pydantic_ai.models.Model`` instance to use
                 for all sub-agents. Defaults to ``"gpt-5.2"``.
-            seed_plan: Optional pre-defined :class:`~pydantask.models.Plan` to seed
-                the initial task DAG. If provided, it is loaded into
-                :class:`~pydantask.models.RuntimeState.plan` at the start of
-                :meth:`run`.
-
-                Notes:
-                * Task IDs are respected and used as keys in ``RuntimeState.plan``.
-                * ``RuntimeState.next_task_id`` is set to ``max(task_id) + 1``.
-                * Dependencies are validated to ensure they reference existing tasks.
-            planning_mode: Controls whether the supervisor is allowed to modify the
-                plan at runtime.
-
-                * ``"llm"``: The supervisor may add/patch tasks.
-                * ``"hybrid"``: Same as ``"llm"``, but typically used with
-                  ``seed_plan`` to provide an initial DAG the supervisor can extend.
-                * ``"fixed"``: The supervisor is not given the plan-mutation tools
-                  (``add_task``/``patch_task``) and can only execute/transition the
-                  existing tasks.
             critic_agent: Optional pre-configured critic ``Agent``. If omitted, a
                 default critic agent is created.
             supervisor_agent: Optional supervisor ``Agent`` used to manage the task
@@ -240,7 +228,7 @@ class DeepAgent:
         self._critic_agent = critic_agent or Agent(
             model=self._retry_model,
             name="_default_Critic_Agent",
-            system_prompt=CRITIC_SYS_PROMPT,
+            system_prompt=COMPRESSED_CRITIC_SYS_PROMPT,
             output_type=TaskQAResult,
             deps_type=RuntimeState,
             tools=[get_current_datetime, think_tool],
@@ -250,7 +238,7 @@ class DeepAgent:
         self._supervisor_agent = supervisor_agent or Agent(
             model=self._retry_model,
             name="_dynamic_Supervisor_Agent",
-            system_prompt=DYNAMIC_SUPERVISOR_SYS_PROMPT,
+            system_prompt=COMPRESSED_SUPER_PROMPT,
             output_type=SupervisorDecision,
             deps_type=RuntimeState,
             tools=self._default_supervisor_tools(),
@@ -281,7 +269,7 @@ class DeepAgent:
         self._researcher_agent = researcher_agent or Agent(
             model=self._retry_model,
             name="_default_Research_Agent",
-            system_prompt=RESEARCH_AGENT_SYS_PROMPT,
+            system_prompt=COMPRESSED_RESEARCH_SYS_PROMPT,
             tools=_default_research_tool_set,
             deps_type=TaskRunDeps,
             output_type=TaskResult,
@@ -445,7 +433,7 @@ class DeepAgent:
         producer_agent = Agent(
             model=self._retry_model,
             name="_default_Producer_agent",
-            system_prompt=PRODUCER_SYS_PROMPT,
+            system_prompt=COMPRESSED_PRODUCER_SYS_PROMPT,
             deps_type=TaskRunDeps,
             output_type=TaskResult,
             tools=[
@@ -474,7 +462,7 @@ class DeepAgent:
         general_worker_agent = Agent(
             model=self._retry_model,
             name="_default_General_Worker_Agent",
-            system_prompt=WORKER_AGENT_SYS_PROMPT,
+            system_prompt=COMPRESSED_WORKER_SYS_PROMPT,
             deps_type=TaskRunDeps,
             output_type=TaskResult,
             tools=[
@@ -713,7 +701,7 @@ class DeepAgent:
             payload["error_msg"] = error_msg
         await self._record_event("task_status_updated", payload)
 
-    async def _persist_full_task_result_payload(
+    def _persist_full_task_result_payload(
         self, task_id: int, result_payload: Dict[str, Any]
     ) -> str | None:
         """Persist the full TaskResult payload under the checkpoint directory.
@@ -730,7 +718,7 @@ class DeepAgent:
         relpath = f"{TASK_RESULT_ARTIFACT_DIRNAME}/task_{task_id}.json"
         path = self.checkpoint_path / relpath
         with path.open("w", encoding="utf-8") as fh:
-            await asyncio.to_thread(json.dump, result_payload, fh, ensure_ascii=False)
+            json.dump(result_payload, fh, ensure_ascii=False)
 
         return relpath
 
@@ -764,9 +752,7 @@ class DeepAgent:
         detailed_output = result_payload.get("detailed_output") or ""
         if detailed_output and len(detailed_output) > EVENT_RESULT_DETAIL_TRUNCATION:
             # Persist the full payload to a sidecar file so replay can restore it.
-            full_result_path = await self._persist_full_task_result_payload(
-                task.task_id, result_payload
-            )
+            full_result_path = await asyncio.to_thread(self._persist_full_task_result_payload,task.task_id, result_payload)
 
             truncation_notice = f"\n\n...[TRUNCATED {len(detailed_output) - EVENT_RESULT_DETAIL_TRUNCATION} chars]..."
             result_payload["detailed_output"] = (
@@ -1282,7 +1268,7 @@ Instructions:
             await self._record_event(
                 "task_added",
                 {
-                    "task": task.model_dump(),
+                    "task": task.model_dump(mode="json"),
                     "next_task_id": ctx.deps.next_task_id,
                 },
             )
@@ -1321,6 +1307,7 @@ Instructions:
         ctx: RunContext[RuntimeState],
         task_id: int,
         sub_task_objective: Optional[str] = None,
+        capability: Optional[str] = None,
         dependencies: Optional[List[int]] = None,
     ):
         """Tool: Patch Task.
@@ -1334,6 +1321,7 @@ Instructions:
             ctx: ``RunContext`` carrying the current ``RuntimeState``.
             task_id: Identifier of the task to modify.
             sub_task_objective: New sub-task objective, if changing.
+            capability: New capability to use, if changing
             dependencies: Updated list of dependency IDs, if changing.
         """
         async with self._plan_lock:
@@ -1349,6 +1337,10 @@ Instructions:
             if dependencies is not None:
                 task.sub_task_dependencies = dependencies
                 payload["dependencies"] = task.sub_task_dependencies
+
+            if capability is not None:
+                task.capability = capability
+                payload["capability"] = task.capability
 
             if len(payload) > 1:
                 await self._record_event("task_patched", payload)
@@ -1640,7 +1632,7 @@ Instructions:
 
             await self._record_event(
                 "supervisor_decision",
-                supervisor_response.model_dump(),
+                supervisor_response.model_dump(mode="json"),
             )
 
             if supervisor_response.all_tasks_completed:
@@ -1903,9 +1895,6 @@ Instructions:
         if len(ready_steps) == 0:
             return []
 
-        if not ready_steps:
-            return []
-
         # 2. Claim tasks (READY/RERUN -> RUNNING) atomically so we don't schedule the same
         # task twice in parallel.
         claimed_steps: list[TaskItem] = []
@@ -2156,7 +2145,7 @@ Context-budget note:
             "critic_feedback",
             {
                 "task_id": task.task_id,
-                "feedback": review.model_dump(),
+                "feedback": review.model_dump(mode="json"),
                 "attempt_count": task.attempt_count,
             },
         )
