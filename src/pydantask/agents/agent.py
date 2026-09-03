@@ -43,7 +43,6 @@ from pydantic_ai.models import Model
 from pydantask.prompts.prompts_v2 import (
     SUPERVISOR_INPUT_PROMPT,
     WORKER_AGENT_SYS_PROMPT,
-    DYNAMIC_SUPERVISOR_SYS_PROMPT,
     BOOTSTRAP_INSTRUCT,
     ORCHESTRATION_INSTRUCT,
     COMPRESSED_RESEARCH_SYS_PROMPT,
