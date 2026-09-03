@@ -2,7 +2,7 @@
 #           SUPERVISOR PROMPTS ###
 ##################################
 
-BOOTSTRAP_INSTURCT = """
+BOOTSTRAP_INSTRUCT = """
 ------------------------------------------------------------
 YOUR CURRENT IMPERATIVE: INITIAL GRAPH BOOTSTRAPPING
 ------------------------------------------------------------

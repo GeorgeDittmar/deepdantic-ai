@@ -42,7 +42,9 @@ from pathlib import Path
 from pydantic_ai.models import Model
 from pydantask.prompts.prompts_v2 import (
     SUPERVISOR_INPUT_PROMPT,
-    BOOTSTRAP_INSTURCT,
+    WORKER_AGENT_SYS_PROMPT,
+    DYNAMIC_SUPERVISOR_SYS_PROMPT,
+    BOOTSTRAP_INSTRUCT,
     ORCHESTRATION_INSTRUCT,
     COMPRESSED_RESEARCH_SYS_PROMPT,
     COMPRESSED_SUPER_PROMPT,
@@ -146,26 +148,21 @@ class DeepAgent:
             objective: The overall objective / task the deep agent is working on.
             model: Model identifier or ``pydantic_ai.models.Model`` instance to use
                 for all sub-agents. Defaults to ``"gpt-5.2"``.
-            critic_agent: Optional pre-configured critic ``Agent``. If omitted, a
-                default critic agent is created.
-            supervisor_agent: Optional supervisor ``Agent`` used to manage the task
-                DAG. If omitted, a default dynamic supervisor is created.
-            researcher_agent: Optional research ``Agent``. If omitted, a default
-                web/doc research agent is created.
-            producer_agent: Optional producer ``Agent``. If omitted, a default
-                agent is created.
+            default_capabilities_enabled: If ``True``, register built-in capabilities
+                (research, worker, producer) by default.
             max_steps: Maximum number of DeepAgent control-loop iterations to run
                 before forcing termination.
-            set_token_budget: Optional global token budget for the run. Currently
-                stored but not strictly enforced.
+            max_steps_no_progress: Number of consecutive cycles with no executed tasks
+                before aborting with a deadlock report.
+            set_token_budget: Optional global token budget for the run.
             capabilities: Additional ``CapabilityDescription`` objects to register as
                 callable sub-agents alongside the built-ins.
-            output_type: Pydantic model type used as the default output structure
-                for the producer agent.
             trace: If ``True``, auto-configure tracing via the configured backend.
             checkpoint: If ``True``, enable event-sourced checkpoint logging for recovery.
             checkpoint_dir: Optional directory to reuse for checkpoints when resuming a run.
                 If omitted, a unique directory under ``_checkpoint/`` is created.
+            resume_from_checkpoint: If ``True``, attempt to replay from an existing
+                checkpoint when starting the agent.
             verbose_logging: If ``True``, log richer debugging information during
                 execution.
         """
@@ -1593,7 +1590,7 @@ Instructions:
             self._last_scheduler_report = await self._scheduler_pass(runtime_state)
 
             current_instruction = (
-                BOOTSTRAP_INSTURCT
+                BOOTSTRAP_INSTRUCT
                 if len(runtime_state.plan) == 0
                 else ORCHESTRATION_INSTRUCT
             )

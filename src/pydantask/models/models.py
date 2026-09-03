@@ -55,7 +55,7 @@ class TaskQAResult(BaseModel):
     )
     reasoning: str = Field(
         default="",
-        description="Detailed explanation of how the result was judged, why it god the score that it did and feedback for supervisor to attempt a retry.",
+        description="Detailed explanation of how the result was judged, why it got the score that it did and feedback for supervisor to attempt a retry.",
     )
 
     passed: bool = Field(

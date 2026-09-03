@@ -3,7 +3,7 @@ name = "pydantask"
 version = "0.1.0a6"
 description = "A hierarchical multi-agent Deep Agent harness built on Pydantic AI"
 readme = "README.md"
-requires-python = ">=3.12" 
+requires-python = ">=3.12"
 license = {text = "Apache-2.0"}
 authors = [
     {name = "George Dittmar ", email = "your.email@example.com"}
@@ -17,24 +17,12 @@ classifiers = [
 ]
 dependencies = [
     "aiofiles>=25.1.0",
-    "griffe-pydantic>=1.3.1",
-    "langfuse>=3.11.0",
-    "langsmith>=0.7.32",
-    "logfire>=4.31.0",
     "loguru>=0.7.3",
-    "mcp>=1.26.0",
-    "mkdocstrings>=1.0.4",
-    "mkdocstrings-python>=2.0.3",
     "pydantic>=2.12.5",
     "pydantic-ai>=1.48.0",
     "pydantic-ai-slim[anthropic,duckduckgo]>=1.75.0",
-    "pydantic-graph>=1.32.0",
-    "pytest>=9.0.3",
-    "pytest-asyncio>=1.3.0",
     "pyyaml>=6.0.3",
-    "tavily>=1.1.0",
     "tenacity>=9.1.2",
-    "zensical>=0.0.32",
 ]
 
 [project.optional-dependencies]
@@ -46,6 +34,15 @@ docs = [
     "mkdocs>=1.6.1",
     "mkdocs-material>=9.7.1",
     "mkdocstrings[python]>=1.0.3",
+    "griffe-pydantic>=1.3.1",
+]
+tracing = [
+    "langfuse>=3.11.0",
+    "langsmith>=0.7.32",
+    "logfire>=4.31.0",
+]
+research = [
+    "tavily>=1.1.0",
 ]
 
 [build-system]
