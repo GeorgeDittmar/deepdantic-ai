@@ -11,6 +11,29 @@ from pydantask.models.models import TaskRunDeps  # adjust import path if differe
 
 T = TypeVar("T")
 
+import asyncio
+import inspect
+from functools import partial
+
+def is_async_callable(obj) -> bool:
+    if not callable(obj):
+        return False
+    
+    # Handle partial functions
+    if isinstance(obj, partial):
+        return is_async_callable(obj.func)
+    
+    # Check standard async functions, methods, and closures
+    if inspect.iscoroutinefunction(obj):
+        return True
+    
+    # Check classes with an asynchronous __call__ method
+    if hasattr(obj, '__call__'):
+        return inspect.iscoroutinefunction(obj.__call__)
+        
+    return False
+
+
 @dataclass
 class RunResult(Generic[T]):
     output: T
@@ -72,5 +95,6 @@ def as_runner(obj: Any) -> CapabilityRunner[Any]:
         return AgentRunner(obj)
     if callable(obj):
         # assume async callable(prompt, deps) by default
+        print("RUNNING FUNCTIONS")
         return AsyncFuncRunner(obj)
     raise TypeError(f"Unsupported capability type: {type(obj)!r}")

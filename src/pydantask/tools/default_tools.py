@@ -72,7 +72,7 @@ async def think_tool(reflection: str) -> str:
     Returns:
         Confirmation that reflection was recorded for decision-making
     """
-    return f"{reflection}"
+    return f""
 
 
 async def write_to_file_system(
@@ -139,6 +139,15 @@ async def delete_from_file_system(path: str) -> str:
     except Exception as e:
         return f"An error occurred: {e}"
 
+
+async def read_file_contents(file_path:str):
+    """Reads a file from the file system to inspect its contents. 
+    
+    When to use:
+        - Need to read a file that is mentioned in a TaskResult"""
+    
+    with open(file_path, "r") as f:
+        return f.read()
 
 async def read_from_file_system(
     ctx: RunContext[RuntimeState | TaskRunDeps],
@@ -219,20 +228,20 @@ async def list_documents(ctx: RunContext[RuntimeState | TaskRunDeps]) -> str:
     return "\n".join(lines)
 
 
-async def list_completed_tasks(ctx: RunContext[TaskRunDeps]) -> str:
+async def list_completed_tasks(ctx: RunContext[RuntimeState | TaskRunDeps]) -> str:
     """List all tasks that have completed, with brief summaries.
 
-    Useful for agents that need to review prior work before deciding next steps.
+    Works in both supervisor/critic context (deps_type=RuntimeState) and
+    worker context (deps_type=TaskRunDeps).
     """
-    if not ctx.deps.runtime_state.plan:
+    runtime = _get_runtime_state(ctx.deps)
+    if not runtime.plan:
         return "No tasks in plan."
 
     from pydantask.models import TaskStatus  # local import to avoid cycles
 
     lines: list[str] = []
-    for task_id, task in sorted(
-        ctx.deps.runtime_state.plan.items(), key=lambda kv: kv[0]
-    ):
+    for task_id, task in sorted(runtime.plan.items(), key=lambda kv: kv[0]):
         if task.status != TaskStatus.COMPLETED:
             continue
         summary = task.result.summary if task.result is not None else "<no result>"
@@ -304,23 +313,25 @@ async def read_task_context(
 
 
 async def get_task_result(
-    ctx: RunContext[TaskRunDeps],
+    ctx: RunContext[RuntimeState | TaskRunDeps],
     task_id: int,
     max_chars: int | None = 20_000,
 ) -> str:
     """Return the full TaskResult for a given task_id as JSON.
 
-    When to use:
-        - When you need to inspect the detailed output of a prior task.
-        - Before synthesizing or critiquing based on earlier work.
+    Works in both supervisor/critic context (deps_type=RuntimeState) and
+    worker context (deps_type=TaskRunDeps).
     """
 
-    # check if task_id if valid. if not then return saying incorrect id
+    runtime = _get_runtime_state(ctx.deps)
 
-    if task_id not in ctx.deps.runtime_state.plan:
-        return f"CRITICAL: task id: {task_id} does not exist in the plan. Attempt call again and double check the task id before trying again."
+    if task_id not in runtime.plan:
+        return (
+            f"CRITICAL: task id: {task_id} does not exist in the plan. "
+            "Attempt call again and double check the task id before trying again."
+        )
 
-    task = ctx.deps.runtime_state.plan.get(task_id, None)
+    task = runtime.plan.get(task_id, None)
 
     if task is None:
         return f"CRITICAL: No task with id {task_id}."

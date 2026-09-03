@@ -231,7 +231,7 @@ agent = DeepAgent(
 
 ```python
 from pydantask.agents.agent import DeepAgent
-from pydantask.capabilities.runner import as_runner
+from pydantask.capabilities.runner_v2 import as_runner
 from pydantask.models import CapabilityDescription, TaskResult, TaskRunDeps
 
 

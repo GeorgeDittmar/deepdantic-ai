@@ -3,6 +3,7 @@ import json
 import os
 import asyncio
 import inspect
+import re
 from httpx import AsyncClient, HTTPStatusError
 from tenacity import (
     wait_exponential,
@@ -21,6 +22,11 @@ from pydantic_ai import Agent, RunContext
 from typing import List, Optional, Literal, Any, Dict, Callable, Union, Type
 from datetime import datetime
 from asyncio import TaskGroup
+from pydantask.capabilities.introspection import (
+    callable_input_schema,
+    format_callable_inputs_for_prompt,
+    unwrap_callable,
+)
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.models.anthropic import AnthropicModel
@@ -29,7 +35,7 @@ from pydantic_ai.common_tools.tavily import tavily_search_tool
 from pydantic_ai.common_tools.duckduckgo import duckduckgo_search_tool
 from pydantic_ai.usage import UsageLimits
 
-from pydantask.capabilities.runner import as_runner
+from pydantask.capabilities.runner_v2 import as_runner, CapabilityRunner
 from pathlib import Path
 from pydantic_ai.models import Model
 from pydantic_ai.settings import ModelSettings
@@ -47,7 +53,7 @@ from pydantask.prompts.prompts_v2 import (
     COMPRESSED_SUPER_PROMPT,
     COMPRESSED_CRITIC_SYS_PROMPT,
     COMPRESSED_WORKER_SYS_PROMPT,
-    COMPRESSED_PRODUCER_SYS_PROMPT
+    COMPRESSED_PRODUCER_SYS_PROMPT,
 )
 
 from pydantask.models import (
@@ -59,7 +65,8 @@ from pydantask.models import (
     SupervisorDecision,
     CapabilityDescription,
     TaskResult,
-    DeepAgentRunResult,
+    ArtifactRef,
+    PydanTaskRunResult,
     TaskRunDeps,
     TracingBackend,
 )
@@ -74,7 +81,16 @@ from pydantask.tools.default_tools import (
     list_completed_tasks,
     read_scratch_notes,
     think_tool,
+    read_file_contents
 )
+from pydantask.tools.artifact_tools import (
+    put_artifact,
+    get_artifact,
+    list_artifacts,
+    attach_artifact_to_result,
+    store_file_as_artifact,
+)
+
 from pydantask.manager.checkpointer import CheckpointEvent, CheckpointRecorder
 from pydantask.observe.tracing import (
     traced,
@@ -115,20 +131,19 @@ class DeepAgent:
         model: str | Model = "gpt-5.2",
         # seed_plan: Plan | None = None,
         # planning_mode: Literal["llm", "fixed", "hybrid"] = "llm",
-        critic_agent: Optional[Agent] = None,
-        supervisor_agent: Optional[Agent] = None,
-        researcher_agent: Optional[Agent] = None,
+        default_capabilities_enabled: bool = False,
+        custom_supervisor: Agent = None,
         max_steps: int = 20,
         max_steps_no_progress: int = 5,
         set_token_budget: Union[int, None] = None,
-        sub_agents: Union[None, list[CapabilityDescription]] = None,
+        capabilities: Union[None, list[CapabilityDescription]] = None,
         # default output type for the producer agent, can be set to a default type or custom pydantic model for better structure and validation of final output
         # output_type: Type = TaskResult,
         # planning_mode: str = "dynamic",  # "static" | "dynamic"
         trace: bool = False,
         checkpoint: bool = False,
         checkpoint_dir: Path | str | None = None,
-        resume: bool = False,
+        resume_from_checkpoint: bool = False,
         verbose_logging: bool = False,
     ):
         """Initialize a DeepAgent instance.
@@ -149,7 +164,7 @@ class DeepAgent:
                 before forcing termination.
             set_token_budget: Optional global token budget for the run. Currently
                 stored but not strictly enforced.
-            sub_agents: Additional ``CapabilityDescription`` objects to register as
+            capabilities: Additional ``CapabilityDescription`` objects to register as
                 callable sub-agents alongside the built-ins.
             output_type: Pydantic model type used as the default output structure
                 for the producer agent.
@@ -194,14 +209,14 @@ class DeepAgent:
         # - `checkpoint_dir=...` forces checkpointing on and chooses the directory.
         # - `resume=True` requires `checkpoint_dir` and will replay
         #   events from that directory on `run()`.
-        if resume and checkpoint_dir is None:
+        if resume_from_checkpoint and checkpoint_dir is None:
             raise ValueError("checkpoint_dir must be provided when resume=True")
 
         if checkpoint_dir is not None or checkpoint:
             checkpoint = True
 
         self.checkpoint = checkpoint
-        self.resume = resume
+        self.resume = resume_from_checkpoint
 
         # Concurrency guardrails:
         # - `_plan_lock` protects plan-level mutations and task claiming (READY->RUNNING).
@@ -223,19 +238,10 @@ class DeepAgent:
         # We inject the retrying httpx client into the provider for durability.
         self._retry_model = self._build_model(model)
 
-        # NOTE: Filesystem tools exist in `pydantask.tools.default_tools`, but are not
-        # enabled by default. The harness is currently in-memory focused.
-        self._critic_agent = critic_agent or Agent(
-            model=self._retry_model,
-            name="_default_Critic_Agent",
-            system_prompt=COMPRESSED_CRITIC_SYS_PROMPT,
-            output_type=TaskQAResult,
-            deps_type=RuntimeState,
-            tools=[get_current_datetime, think_tool],
-            # end_strategy="exhaustive",
-        )
+        if custom_supervisor:
+            self._supervisor_agent = custom_supervisor
 
-        self._supervisor_agent = supervisor_agent or Agent(
+        self._supervisor_agent = custom_supervisor or Agent(
             model=self._retry_model,
             name="_dynamic_Supervisor_Agent",
             system_prompt=COMPRESSED_SUPER_PROMPT,
@@ -245,6 +251,297 @@ class DeepAgent:
             end_strategy="exhaustive",
         )
 
+        _default_capabiliites = []
+        if default_capabilities_enabled:
+            _default_capabiliites = self._setup_default_capabilities()
+
+        self._capability_registry = self._setup_capability_registry(
+            _default_capabiliites, additonal_capabilities=capabilities
+        )
+
+        self._critic_agent = Agent(
+            model=self._retry_model,
+            name="_default_Critic_Agent",
+            system_prompt=COMPRESSED_CRITIC_SYS_PROMPT,
+            output_type=TaskQAResult,
+            deps_type=RuntimeState,
+            tools=[
+                get_current_datetime,
+                think_tool,
+                # Evidence retrieval (bounded)
+                get_task_result,
+                list_artifacts,
+                get_artifact,
+            ],
+            # end_strategy="exhaustive",
+        )
+        # Scheduler/system notes injected into the next supervisor prompt.
+        self._last_scheduler_report: str = ""
+
+    async def _coerce_output_to_task_result(
+        self,
+        step: TaskItem,
+        output: Any,
+        *,
+        runtime_state: RuntimeState | None = None,
+    ) -> TaskResult:
+        """Coerce arbitrary capability outputs into the canonical TaskResult.
+
+        Design goal: capability authors can return "anything" (str/dict/Pydantic model),
+        and DeepAgent will normalize it for downstream evaluation/synthesis.
+
+        Enterprise/ops goal: if the output references on-disk files, ingest them into
+        the run's artifact store so the critic/producer can retrieve contents via
+        `get_artifact` (rather than relying on host paths).
+        """
+
+        rejected_files: list[dict[str, Any]] = []
+
+        def _allowed_source_roots() -> list[Path]:
+            """Roots from which host-side files may be ingested as artifacts.
+
+            IMPORTANT SECURITY NOTE:
+            We do NOT want to ingest arbitrary host files just because a model
+            mentions a path (e.g. "/etc/passwd"). We therefore restrict source
+            file ingestion to a small allowlist of safe roots.
+
+            Current policy:
+              - allow files under ./tmp
+              - allow files under the active checkpoint directory (if available)
+            """
+            roots: list[Path] = []
+
+            # Common deterministic tools write here.
+            roots.append((Path.cwd() / "tmp").resolve())
+
+            # If checkpointing is enabled, allow ingesting files created under it.
+            if runtime_state is not None:
+                recorder = getattr(runtime_state, "checkpoint_recorder", None)
+                directory = getattr(recorder, "directory", None)
+                if isinstance(directory, Path):
+                    roots.append(directory.resolve())
+
+            # Dedupe
+            out: list[Path] = []
+            seen: set[str] = set()
+            for r in roots:
+                key = str(r)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(r)
+            return out
+
+        def _is_allowed_source_file(p: Path) -> bool:
+            try:
+                rp = p.resolve()
+            except Exception:
+                return False
+
+            for root in _allowed_source_roots():
+                try:
+                    if rp == root or root in rp.parents:
+                        return True
+                except Exception:
+                    continue
+            return False
+
+        def _existing_files_from_text(text: str) -> list[Path]:
+            """Extract safe, existing files from text.
+
+            Only returns files under the allowlisted roots.
+            """
+            candidates: list[Path] = []
+
+            # 1) If the entire output is a path, prefer that.
+            p = Path(text)
+            if p.exists() and p.is_file():
+                if _is_allowed_source_file(p):
+                    candidates.append(p)
+                else:
+                    rejected_files.append(
+                        {"path": str(p), "reason": "outside_allowed_roots"}
+                    )
+
+            # 2) Otherwise, attempt to extract path-like tokens.
+            # Best-effort: only keep tokens that resolve to an existing file AND
+            # live under allowlisted roots.
+            for token in re.findall(r"[^\s'\"]+", text):
+                cleaned = token.strip().strip(".,;:()[]{}<>")
+                if not cleaned:
+                    continue
+                cp = Path(cleaned)
+                if not (cp.exists() and cp.is_file()):
+                    continue
+                if _is_allowed_source_file(cp):
+                    candidates.append(cp)
+                else:
+                    rejected_files.append(
+                        {"path": str(cp), "reason": "outside_allowed_roots"}
+                    )
+
+            # Dedupe while preserving order.
+            out: list[Path] = []
+            seen: set[str] = set()
+            for c in candidates:
+                try:
+                    key = str(c.resolve())
+                except Exception:
+                    key = str(c)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(c)
+            return out
+
+        if isinstance(output, TaskResult):
+            if output.task_id != step.task_id:
+                output.task_id = step.task_id
+            return output
+
+        meta: dict[str, Any] = {
+            "raw_output_type": type(output).__name__,
+            "coerced": True,
+        }
+
+        if output is None:
+            return TaskResult(
+                task_id=step.task_id,
+                status=TaskStatus.ERRORED,
+                summary="Capability returned no output.",
+                detailed_output="",
+                error_msg="Capability returned None",
+                metadata=meta,
+            )
+
+        if isinstance(output, BaseModel):
+            try:
+                dumped = output.model_dump(mode="json")
+                text = output.model_dump_json(indent=2)
+            except Exception:
+                dumped = {}
+                text = str(output)
+
+            return TaskResult(
+                task_id=step.task_id,
+                status=TaskStatus.COMPLETED,
+                summary=f"Capability returned {type(output).__name__}.",
+                detailed_output=text,
+                data=dumped if isinstance(dumped, dict) else {},
+                metadata=meta,
+            )
+
+        if isinstance(output, (dict, list)):
+            try:
+                text = json.dumps(output, ensure_ascii=False, indent=2)
+            except Exception:
+                text = str(output)
+
+            data_payload: dict[str, Any] = {}
+            if isinstance(output, dict):
+                if len(text) <= 16_000:
+                    data_payload = output
+                else:
+                    meta["data_omitted_reason"] = "too_large"
+
+            return TaskResult(
+                task_id=step.task_id,
+                status=TaskStatus.COMPLETED,
+                summary="Capability returned structured data.",
+                detailed_output=text,
+                data=data_payload,
+                metadata=meta,
+            )
+
+        # Normalize to string and attempt file-ingestion.
+        text = str(output)
+        files: list[Path] = []
+        if isinstance(output, Path):
+            if output.exists() and output.is_file():
+                files = [output]
+        elif (
+            isinstance(output, (list, tuple))
+            and output
+            and all(isinstance(x, (str, Path)) for x in output)
+        ):
+            # Allow callables to return ["tmp/a.txt", "tmp/b.txt"]
+            for item in output:
+                if isinstance(item, Path):
+                    if item.exists() and item.is_file():
+                        files.append(item)
+                else:
+                    files.extend(_existing_files_from_text(str(item)))
+        elif isinstance(output, str):
+            files = _existing_files_from_text(output)
+
+        artifact_refs: list[ArtifactRef] = []
+        file_records: list[dict[str, Any]] = []
+        if runtime_state is not None and files:
+            for p in files:
+                try:
+                    ref = await store_file_as_artifact(
+                        runtime_state,
+                        file_path=p,
+                        task_id=step.task_id,
+                        name=p.name,
+                    )
+                    artifact_refs.append(ref)
+                    file_records.append(
+                        {
+                            "path": str(p),
+                            "artifact_id": ref.artifact_id,
+                            "uri": ref.uri,
+                            "mime_type": ref.mime_type,
+                            "size_bytes": ref.size_bytes,
+                        }
+                    )
+                except Exception as e:
+                    file_records.append({"path": str(p), "error": str(e)})
+
+        if file_records:
+            meta["file_outputs"] = file_records
+        if rejected_files:
+            meta["file_outputs_rejected"] = rejected_files
+
+        # Summary/preview.
+        summary = (text.strip().splitlines()[0] if text else "").strip()
+        if len(summary) > 280:
+            summary = summary[:280] + "..."
+
+        detail_parts: list[str] = [text]
+        if artifact_refs:
+            detail_parts.append(
+                "\n\n---\nFile outputs ingested as artifacts (preferred for review):"
+            )
+            for r in artifact_refs:
+                detail_parts.append(
+                    f"- {r.name or '<unnamed>'}: artifact_id={r.artifact_id} uri={r.uri}"
+                )
+                if r.preview:
+                    detail_parts.append(
+                        "  preview:\n" + self._truncate_text(r.preview, 1500)
+                    )
+
+        tr = TaskResult(
+            task_id=step.task_id,
+            status=TaskStatus.COMPLETED,
+            summary=(
+                f"Produced {len(artifact_refs)} artifact file(s)."
+                if artifact_refs
+                else (summary or "Capability returned text output.")
+            ),
+            detailed_output="\n".join(detail_parts).strip(),
+            metadata=meta,
+        )
+        if artifact_refs:
+            tr.artifacts.extend(artifact_refs)
+        return tr
+
+    def _setup_default_capabilities(self) -> List[CapabilityDescription]:
+
+        # NOTE: Filesystem tools exist in `pydantask.tools.default_tools`, but are not
+        # enabled by default. The harness is currently in-memory focused.
+
         # TODO: rework some of these tools
         tavily_api_key = os.getenv("TAVILY_API_KEY", None)
 
@@ -253,6 +550,11 @@ class DeepAgent:
             append_scratch_note,
             read_scratch_notes,
             get_current_datetime,
+            # Artifact store (segregated, resumable)
+            put_artifact,
+            get_artifact,
+            list_artifacts,
+            attach_artifact_to_result,
             # fetch_url_content,
             # Cross-agent "consult" (bounded, logged)
             self.consult_capability,
@@ -266,7 +568,7 @@ class DeepAgent:
         else:
             _default_research_tool_set.append(tavily_search_tool(tavily_api_key))
 
-        self._researcher_agent = researcher_agent or Agent(
+        self._researcher_agent = Agent(
             model=self._retry_model,
             name="_default_Research_Agent",
             system_prompt=COMPRESSED_RESEARCH_SYS_PROMPT,
@@ -275,12 +577,75 @@ class DeepAgent:
             output_type=TaskResult,
         )
 
-        self._capability_registry = self._setup_capabilities(
-            additonal_capabilities=sub_agents
+        general_worker_agent = Agent(
+            model=self._retry_model,
+            name="_default_General_Worker_Agent",
+            system_prompt=COMPRESSED_WORKER_SYS_PROMPT,
+            deps_type=TaskRunDeps,
+            output_type=TaskResult,
+            tools=[
+                # list_documents,
+                list_completed_tasks,
+                get_task_result,
+                # Artifact store (segregated, resumable)
+                put_artifact,
+                get_artifact,
+                list_artifacts,
+                attach_artifact_to_result,
+                # Cross-agent "consult" (bounded, logged)
+                think_tool,
+                append_scratch_note,
+                read_scratch_notes,
+                get_current_datetime,
+            ],
         )
 
-        # Scheduler/system notes injected into the next supervisor prompt.
-        self._last_scheduler_report: str = ""
+        producer_agent = Agent(
+            model=self._retry_model,
+            name="_default_Producer_agent",
+            system_prompt=COMPRESSED_PRODUCER_SYS_PROMPT,
+            deps_type=TaskRunDeps,
+            output_type=TaskResult,
+            tools=[
+                # Plan / history inspection
+                list_completed_tasks,
+                get_task_result,
+                # Artifact store (segregated, resumable)
+                put_artifact,
+                get_artifact,
+                list_artifacts,
+                attach_artifact_to_result,
+                # Cross-agent "consult" (bounded, logged)
+                # Reflection
+                think_tool,
+            ],
+        )
+
+        producer = CapabilityDescription(
+            name="producer_agent",
+            description="Produces output based on information from various sources and sub agents.",
+            tool_func=as_runner(producer_agent),
+        )
+
+        researcher = CapabilityDescription(
+            name="research_agent",
+            description="Tool to research information. This could include searching the web or querying a data source.",
+            tool_func=as_runner(self._researcher_agent),
+        )
+
+        gen_worker = CapabilityDescription(
+            name="worker_agent",
+            description=(
+                "General-purpose worker for analysis, summarization, document editing, "
+                "code or log interpretation, and other non-research tasks that operate on "
+                "existing context."
+            ),
+            tool_func=as_runner(general_worker_agent),
+        )
+
+        capabilities_list = [producer, researcher, gen_worker]
+
+        return capabilities_list
 
     async def aclose(self) -> None:
         """Close underlying resources used by this ``DeepAgent`` instance.
@@ -412,8 +777,10 @@ class DeepAgent:
 
         return AsyncClient(transport=transport)
 
-    def _setup_capabilities(
-        self, additonal_capabilities: Union[None, list[CapabilityDescription]] = None
+    def _setup_capability_registry(
+        self,
+        default_capabilities,
+        additonal_capabilities: Union[None, list[CapabilityDescription]] = None,
     ) -> Dict:
         """Create the default sub-agent capability registry.
 
@@ -430,73 +797,15 @@ class DeepAgent:
             its description and callable agent/tool.
         """
 
-        producer_agent = Agent(
-            model=self._retry_model,
-            name="_default_Producer_agent",
-            system_prompt=COMPRESSED_PRODUCER_SYS_PROMPT,
-            deps_type=TaskRunDeps,
-            output_type=TaskResult,
-            tools=[
-                # Plan / history inspection
-                list_completed_tasks,
-                get_task_result,
-                # Cross-agent "consult" (bounded, logged)
-                self.consult_capability,
-                # Reflection
-                think_tool,
-            ],
-        )
-
-        producer = CapabilityDescription(
-            name="producer_agent",
-            description="Produces output based on information from various sources and sub agents.",
-            tool_func=as_runner(producer_agent),
-        )
-
-        researcher = CapabilityDescription(
-            name="research_agent",
-            description="Tool to research information. This could include searching the web or querying a data source.",
-            tool_func=as_runner(self._researcher_agent),
-        )
-
-        general_worker_agent = Agent(
-            model=self._retry_model,
-            name="_default_General_Worker_Agent",
-            system_prompt=COMPRESSED_WORKER_SYS_PROMPT,
-            deps_type=TaskRunDeps,
-            output_type=TaskResult,
-            tools=[
-                # list_documents,
-                list_completed_tasks,
-                get_task_result,
-                # Cross-agent "consult" (bounded, logged)
-                self.consult_capability,
-                think_tool,
-                append_scratch_note,
-                read_scratch_notes,
-                get_current_datetime,
-            ],
-        )
-
-        gen_worker = CapabilityDescription(
-            name="worker_agent",
-            description=(
-                "General-purpose worker for analysis, summarization, document editing, "
-                "code or log interpretation, and other non-research tasks that operate on "
-                "existing context."
-            ),
-            tool_func=as_runner(general_worker_agent),
-        )
-
-        _capabilities_list = [producer, researcher, gen_worker]
-
+        _capabilities_list = default_capabilities
         # if additional sub agents been supplied then add those to the registry
         if additonal_capabilities:
             _capabilities_list.extend(additonal_capabilities)
 
         _capability_registry = {
-            sub_agent.name: sub_agent for sub_agent in _capabilities_list
+            capability.name: capability for capability in _capabilities_list
         }
+
         # each agent gets its own unique id
         return _capability_registry
 
@@ -573,10 +882,18 @@ class DeepAgent:
             if task_id is None or task_id not in runtime_state.plan:
                 return
             task = runtime_state.plan[task_id]
+
             if "sub_task_objective" in payload:
                 task.sub_task_objective = payload["sub_task_objective"]
             if "dependencies" in payload:
                 task.sub_task_dependencies = payload["dependencies"]
+            if "capability" in payload:
+                task.capability = payload["capability"]
+            if "parameters" in payload and isinstance(payload["parameters"], dict):
+                # Patch semantics for parameters are merge/update.
+                if not isinstance(getattr(task, "parameters", None), dict):
+                    task.parameters = {}
+                task.parameters.update(payload["parameters"])
             if "is_final" in payload:
                 task.is_final = bool(payload["is_final"])
             return
@@ -752,7 +1069,9 @@ class DeepAgent:
         detailed_output = result_payload.get("detailed_output") or ""
         if detailed_output and len(detailed_output) > EVENT_RESULT_DETAIL_TRUNCATION:
             # Persist the full payload to a sidecar file so replay can restore it.
-            full_result_path = await asyncio.to_thread(self._persist_full_task_result_payload,task.task_id, result_payload)
+            full_result_path = await asyncio.to_thread(
+                self._persist_full_task_result_payload, task.task_id, result_payload
+            )
 
             truncation_notice = f"\n\n...[TRUNCATED {len(detailed_output) - EVENT_RESULT_DETAIL_TRUNCATION} chars]..."
             result_payload["detailed_output"] = (
@@ -776,11 +1095,26 @@ class DeepAgent:
         """Format all registered capabilities into a planner-friendly string.
 
         Each line is of the form: ``- <capability_name>: <description>``.
+
+        For callable capabilities (non-Agent), we also display an inferred input
+        contract (argument names/types) so the supervisor knows what structured
+        values to include when creating tasks.
         """
-        lines = []
+        lines: list[str] = []
         for name, desc in self._capability_registry.items():
             description = getattr(desc, "description", "")
             lines.append(f"- {name}: {description}")
+
+            tool_func = getattr(desc, "tool_func", None)
+            func = unwrap_callable(tool_func)
+            if func is None:
+                continue
+
+            schema = callable_input_schema(func)
+            if (schema.get("required") or []) or (schema.get("optional") or []):
+                lines.append("  " + format_callable_inputs_for_prompt(schema))
+                lines.append("  " + "provide via TaskItem.parameters")
+
         return "\n".join(lines)
 
     def _format_plan(self, plan: Plan):
@@ -857,25 +1191,48 @@ class DeepAgent:
         Note: this harness is currently in-memory focused; do not assume any
         filesystem persistence.
         """
-        worker_output = task.result.model_dump_json(indent=2) if task.result else "null"
+        # Keep the inline prompt small. The critic should fetch the full TaskResult
+        # (and any artifacts) via tools.
+        result_summary = "<no result>"
+        artifact_hints: list[str] = []
+        if task.result is not None:
+            result_summary = (task.result.summary or "").strip() or "<empty summary>"
+            for a in getattr(task.result, "artifacts", []) or []:
+                try:
+                    artifact_hints.append(
+                        f"- name={a.name or '<unnamed>'} artifact_id={a.artifact_id} uri={a.uri} mime={a.mime_type}"
+                    )
+                except Exception:
+                    continue
+
+        artifacts_inline = "\n".join(artifact_hints) if artifact_hints else "<none>"
 
         _prompt = f"""
-            
-            Evaluate if the following worker output completed the specified task it was given.
+You are the QA/critic.
 
-            Overall Objective:
-            {ctx.objective}
+Overall objective:
+{ctx.objective}
 
-            Sub Task Definition (TaskItem):
-            {task.model_dump_json(indent=2)}
+Task under review:
+- task_id: {task.task_id}
+- capability: {task.capability}
+- objective: {task.sub_task_objective}
 
-            Worker Output (TaskResult):
-            {worker_output}
+Inline summary (non-authoritative):
+{result_summary}
 
-            In-memory documents / scratchpads:
-            {ctx.document_store}
-            
-            """
+Known artifacts on the TaskResult (may be empty):
+{artifacts_inline}
+
+Instructions (IMPORTANT):
+1) Call `get_task_result(task_id={task.task_id}, max_chars=12000)` to retrieve the full TaskResult JSON.
+2) Call `list_artifacts(task_id={task.task_id})` and then `get_artifact(...)` for any relevant artifacts.
+3) Judge pass/fail based on the retrieved evidence.
+4) If evidence is missing (e.g. only a raw host filesystem path), fail with clear feedback:
+   "Please store the produced content as an artifact and attach it to TaskResult.artifacts".
+
+Return a TaskQAResult.
+"""
         return _prompt
 
     def _is_context_limit_error(self, exc: Exception) -> bool:
@@ -1226,6 +1583,7 @@ Instructions:
         capability: str,
         dependencies: list[int] | None = None,
         metadata: dict | None = None,
+        parameters: dict | None = None,
     ) -> int:
         """Tool: Add Task.
 
@@ -1262,6 +1620,7 @@ Instructions:
                 capability=capability,
                 sub_task_dependencies=dependencies or [],
                 metadata=metadata or {},
+                parameters=parameters or {},
                 status=TaskStatus.READY,
             )
             plan[new_id] = task
@@ -1309,6 +1668,7 @@ Instructions:
         sub_task_objective: Optional[str] = None,
         capability: Optional[str] = None,
         dependencies: Optional[List[int]] = None,
+        parameters: dict | None = None,
     ):
         """Tool: Patch Task.
 
@@ -1341,6 +1701,16 @@ Instructions:
             if capability is not None:
                 task.capability = capability
                 payload["capability"] = task.capability
+
+            if parameters is not None:
+                if not isinstance(getattr(task, "parameters", None), dict):
+                    task.parameters = {}
+                if not isinstance(parameters, dict):
+                    return "Error: 'parameters' must be a dict."
+
+                # Merge semantics: patch updates keys in-place.
+                task.parameters.update(parameters)
+                payload["parameters"] = parameters
 
             if len(payload) > 1:
                 await self._record_event("task_patched", payload)
@@ -1421,6 +1791,80 @@ Instructions:
                         else:
                             task.error_msg = f"Unknown capability: {task.capability!r}"
                     continue
+
+                # Deterministic callable input contract check.
+                # If a capability is a wrapped python callable, ensure required inputs
+                # are present in TaskItem.parameters before we ever schedule it.
+                cap_desc = (
+                    self._capability_registry.get(task.capability)
+                    if task.capability
+                    else None
+                )
+                func = (
+                    unwrap_callable(getattr(cap_desc, "tool_func", None))
+                    if cap_desc
+                    else None
+                )
+                if func is not None:
+                    schema = callable_input_schema(func)
+                    required = list(schema.get("required") or [])
+                    if required:
+                        params = getattr(task, "parameters", None)
+                        if not isinstance(params, dict):
+                            params = {}
+
+                        missing = [k for k in required if k not in params]
+
+                        # Self-heal: if the task was previously errored for missing parameters
+                        # and the supervisor has since patched them in, promote back to runnable.
+                        if (
+                            not missing
+                            and task.status == TaskStatus.ERRORED
+                            and task.metadata.get("errored_reason")
+                            == "missing_required_parameters"
+                        ):
+                            deps_ok_now = self._dependencies_satisfied(task, ctx)
+                            new_status = (
+                                TaskStatus.READY if deps_ok_now else TaskStatus.PENDING
+                            )
+                            changes.append(
+                                f"- Task {task_id}: errored -> {new_status.value} (required parameters supplied)"
+                            )
+                            task.status = new_status
+                            task.error_msg = None
+                            # Clear prior missing-parameter markers.
+                            task.metadata.pop("missing_parameters", None)
+                            task.metadata.pop("errored_reason", None)
+                            await self._record_task_status_event(
+                                task_id,
+                                new_status,
+                                reason="required_parameters_supplied",
+                            )
+
+                        if missing and task.status in {
+                            TaskStatus.PENDING,
+                            TaskStatus.READY,
+                            TaskStatus.RERUN,
+                        }:
+                            msg = (
+                                "Missing required parameters for callable capability "
+                                f"{task.capability!r}: missing={missing}; required={required}. "
+                                "Supervisor must patch the task with parameters={...}."
+                            )
+                            changes.append(
+                                f"- Task {task_id}: {task.status.value} -> errored (missing required parameters: {missing})"
+                            )
+                            task.status = TaskStatus.ERRORED
+                            task.error_msg = msg
+                            task.metadata["missing_parameters"] = missing
+                            task.metadata["errored_reason"] = "missing_required_parameters"
+                            await self._record_task_status_event(
+                                task_id,
+                                TaskStatus.ERRORED,
+                                reason="missing_required_parameters",
+                                error_msg=msg,
+                            )
+                            continue
 
                 # Dependency-based readiness propagation.
                 deps_ok = self._dependencies_satisfied(task, ctx)
@@ -1561,7 +2005,7 @@ Instructions:
         return "\n".join(lines)
 
     @traced()
-    async def run(self) -> DeepAgentRunResult:
+    async def run(self) -> PydanTaskRunResult:
         """Run the full DeepAgent control loop until completion or max steps.
 
         If a ``seed_plan`` was supplied at construction time, it is loaded into the
@@ -1581,7 +2025,9 @@ Instructions:
         runtime_state = self._initialize_runtime_state(
             objective=self.objective, registry=self._capability_registry
         )
+
         self._apply_seed_plan(runtime_state)
+
         if self.resume:
             await self._replay_checkpoint(runtime_state)
 
@@ -1595,7 +2041,7 @@ Instructions:
             logger.info(f"--- Step {step_count} ---")
 
             if step_count == 0:
-                logger.info("====== Planning =======\n")
+                logger.info("======= Planning Phase =======\n")
 
             # Best-effort global token budget enforcement.
             # Use getattr() so unit tests can construct DeepAgent without __init__.
@@ -1769,7 +2215,7 @@ Instructions:
             runtime_state.runtime_steps += 1
             step_count += 1
 
-        return_result = DeepAgentRunResult(
+        return_result = PydanTaskRunResult(
             objective=self.objective,
             final_result=self._select_final_result(runtime_state),
             plan=runtime_state.plan,
@@ -1969,12 +2415,12 @@ Instructions:
 
     @traced(run_type="task", capture_input=False)
     async def execute(
-        self, sub_agent: Agent, step: TaskItem, runtime_state: RuntimeState
+        self, capability: CapabilityRunner, step: TaskItem, runtime_state: RuntimeState
     ) -> TaskItem:
         """Execute a sub-agent for a single task and record the result.
 
         Builds a task-specific prompt (with optional supervisor feedback),
-        runs the provided ``sub_agent``, and updates the ``TaskItem`` status
+        runs the provided ``capabilitiy``, and updates the ``TaskItem`` status
         and result based on success or failure.
         """
 
@@ -2013,10 +2459,24 @@ Instructions:
                     - Do NOT request new research or create new sub-tasks.
                     """
         else:
+            # IMPORTANT: Do not dump full `parameters` into the LLM prompt.
+            # `parameters` is the structured input channel for deterministic/callable
+            # capabilities and can contain large blobs (which would bloat context).
+            # It is still available at runtime via `deps.task.parameters`.
+            task_view: dict[str, Any] = step.model_dump(mode="json")
+            params = task_view.pop("parameters", None)
+            if isinstance(params, dict) and params:
+                keys = sorted(list(params.keys()))
+                task_view["parameters_keys"] = keys[:50]
+                if len(keys) > 50:
+                    task_view["parameters_keys_truncated"] = True
+
+            task_json = json.dumps(task_view, indent=2, ensure_ascii=False)
+
             user_prompt = f"""
                 You are executing TaskItem:
 
-            {step.model_dump_json(indent=2)}
+            {task_json}
 
                 Overall objective:
                 {self.objective}
@@ -2058,7 +2518,7 @@ Context-budget note:
                     tool_calls_limit=tool_call_limit,
                     total_tokens_limit=self._remaining_token_budget(runtime_state),
                 )
-                result = await sub_agent.run(
+                result = await capability.run(
                     user_prompt,
                     deps=task_deps,
                     usage_limits=task_limits,
@@ -2066,7 +2526,32 @@ Context-budget note:
                 self._accumulate_usage(
                     runtime_state, result, label=f"task:{step.task_id}"
                 )
-                step.result = result.output
+
+                # Normalize to canonical TaskResult (required for critic/checkpointing).
+                # Includes best-effort ingestion of file outputs into the artifact store.
+                step.result = await self._coerce_output_to_task_result(
+                    step, result.output, runtime_state=runtime_state
+                )
+
+                # Merge any artifacts the agent attached via `attach_artifact_to_result`.
+                # Tools can't mutate the final TaskResult object directly, so they
+                # stage refs in task.metadata["result_artifacts"].
+                if isinstance(step.result, TaskResult):
+                    pending = step.metadata.get("result_artifacts")
+                    if isinstance(pending, list) and pending:
+                        existing_ids = {
+                            a.artifact_id for a in (step.result.artifacts or [])
+                        }
+                        for item in pending:
+                            try:
+                                ar = ArtifactRef.model_validate(item)
+                            except Exception:
+                                continue
+                            if ar.artifact_id in existing_ids:
+                                continue
+                            step.result.artifacts.append(ar)
+                            existing_ids.add(ar.artifact_id)
+
                 step.status = TaskStatus.NEEDS_REVIEW
                 step.error_msg = None
                 await self._record_task_result(step)

@@ -119,4 +119,3 @@ async def import_yaml_workflow(
         last.is_final = True
 
     return plan
-

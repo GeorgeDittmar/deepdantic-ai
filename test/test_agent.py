@@ -8,6 +8,7 @@ from httpx import AsyncClient
 
 import pydantask.agents.agent as agent_mod
 from pydantask.tools import default_tools
+from pydantask.capabilities.runner_v2 import as_runner
 from pydantask.models import (
     RuntimeState,
     TaskItem,
@@ -128,7 +129,9 @@ def test_deep_agent_init_sets_registry_keys(monkeypatch: pytest.MonkeyPatch):
         # Avoid pulling in pydantic-ai's tool schema machinery for this unit test.
         patch.object(agent_mod, "Agent", autospec=True) as agent_cls,
     ):
-        deep_agent = agent_mod.DeepAgent("Test Goal", trace=False)
+        deep_agent = agent_mod.DeepAgent(
+            "Test Goal", trace=False, default_capabilities_enabled=True
+        )
 
     assert deep_agent.objective == "Test Goal"
     assert "research_agent" in deep_agent._capability_registry
@@ -494,6 +497,51 @@ async def test_append_scratch_note_records_checkpoint_event(
 
 
 @pytest.mark.asyncio
+async def test_get_task_result_tool_supports_runtime_state_deps(
+    runtime_state: RuntimeState,
+):
+    runtime_state.plan[1] = TaskItem(
+        task_id=1,
+        overall_objective=runtime_state.objective,
+        sub_task_objective="x",
+        capability="worker_agent",
+        status=TaskStatus.COMPLETED,
+        result=TaskResult(task_id=1, summary="s", detailed_output="d"),
+    )
+
+    ctx = SimpleNamespace(deps=runtime_state)
+    out = await default_tools.get_task_result(ctx, task_id=1, max_chars=5_000)
+    assert '"summary":' in out
+    assert '"s"' in out
+
+
+@pytest.mark.asyncio
+async def test_list_completed_tasks_tool_supports_runtime_state_deps(
+    runtime_state: RuntimeState,
+):
+    runtime_state.plan[1] = TaskItem(
+        task_id=1,
+        overall_objective=runtime_state.objective,
+        sub_task_objective="x",
+        capability="worker_agent",
+        status=TaskStatus.COMPLETED,
+        result=TaskResult(task_id=1, summary="done"),
+    )
+    runtime_state.plan[2] = TaskItem(
+        task_id=2,
+        overall_objective=runtime_state.objective,
+        sub_task_objective="y",
+        capability="worker_agent",
+        status=TaskStatus.READY,
+    )
+
+    ctx = SimpleNamespace(deps=runtime_state)
+    out = await default_tools.list_completed_tasks(ctx)
+    assert "task_id: 1" in out
+    assert "task_id: 2" not in out
+
+
+@pytest.mark.asyncio
 async def test_run_stops_when_supervisor_says_done(runtime_state: RuntimeState):
     da = make_minimal_deep_agent(prompt="overall")
 
@@ -596,3 +644,86 @@ async def test_run_overrides_completion_when_no_final_task(runtime_state: Runtim
     # The completion guardrail prevents early stop; we run until max_steps.
     assert supervisor.run.await_count == da._max_steps
     assert result.final_result is None
+
+
+@pytest.mark.asyncio
+async def test_scheduler_marks_callable_task_errored_when_missing_parameters(
+    runtime_state: RuntimeState,
+):
+    da = make_minimal_deep_agent(prompt="overall")
+
+    async def write_something_to_file(content: str, filename: str) -> str:
+        return f"wrote {filename}"
+
+    da._capability_registry = {
+        "write_to_file": agent_mod.CapabilityDescription(
+            name="write_to_file",
+            description="",
+            tool_func=as_runner(write_something_to_file),
+        )
+    }
+
+    # Missing the required 'filename'
+    runtime_state.plan[1] = TaskItem(
+        task_id=1,
+        overall_objective=runtime_state.objective,
+        sub_task_objective="write a file",
+        capability="write_to_file",
+        status=TaskStatus.READY,
+        parameters={"content": "hello"},
+    )
+
+    report = await da._scheduler_pass(runtime_state)
+
+    assert "missing required parameters" in report.lower()
+    assert runtime_state.plan[1].status == TaskStatus.ERRORED
+    assert runtime_state.plan[1].metadata.get("missing_parameters") == ["filename"]
+    assert (
+        "missing required parameters" in (runtime_state.plan[1].error_msg or "").lower()
+    )
+
+
+@pytest.mark.asyncio
+async def test_coerce_output_ingests_existing_file_as_artifact(
+    tmp_path, runtime_state: RuntimeState
+):
+    da = make_minimal_deep_agent(prompt="overall")
+
+    # Create a fake checkpoint recorder so artifacts go under tmp_path.
+    cp_dir = tmp_path / "cp"
+    cp_dir.mkdir(parents=True, exist_ok=True)
+
+    class _Recorder:
+        def __init__(self, directory):
+            self.directory = directory
+
+        async def record(self, event_type, payload):
+            return None
+
+    runtime_state.checkpoint_recorder = _Recorder(cp_dir)
+
+    # Create an output file the callable might have produced.
+    out_file = cp_dir / "haiku.md"
+    out_file.write_text(
+        "stars drift\nengines hum softly\nhome is far away\n", encoding="utf-8"
+    )
+
+    step = TaskItem(
+        task_id=1,
+        overall_objective=runtime_state.objective,
+        sub_task_objective="write a haiku file",
+        capability="write_to_file",
+        status=TaskStatus.RUNNING,
+    )
+    runtime_state.plan[1] = step
+
+    tr = await da._coerce_output_to_task_result(
+        step, str(out_file), runtime_state=runtime_state
+    )
+
+    assert isinstance(tr, TaskResult)
+    assert tr.artifacts and len(tr.artifacts) == 1
+    assert tr.artifacts[0].artifact_id.startswith("sha256:")
+    assert tr.artifacts[0].uri.startswith("artifacts/")
+    assert "file outputs ingested as artifacts" in tr.detailed_output.lower()
+    assert "stars drift" in tr.detailed_output
