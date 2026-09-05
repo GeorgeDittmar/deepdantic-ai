@@ -127,9 +127,10 @@ class DeepAgent:
         # seed_plan: Plan | None = None,
         # planning_mode: Literal["llm", "fixed", "hybrid"] = "llm",
         default_capabilities_enabled: bool = False,
-        custom_supervisor: Agent = None,
+        custom_supervisor: Agent | None = None,
         max_steps: int = 20,
         max_steps_no_progress: int = 5,
+        max_concurrent_tasks: int = 4,
         set_token_budget: Union[int, None] = None,
         capabilities: Union[None, list[CapabilityDescription]] = None,
         # default output type for the producer agent, can be set to a default type or custom pydantic model for better structure and validation of final output
@@ -153,6 +154,9 @@ class DeepAgent:
                 before forcing termination.
             max_steps_no_progress: Number of consecutive cycles with no executed tasks
                 before aborting with a deadlock report.
+            max_concurrent_tasks: Maximum number of tasks to run concurrently in each
+                control-loop iteration. Tasks exceeding this limit are batched and
+                executed sequentially in chunks. Defaults to ``4``.
             set_token_budget: Optional global token budget for the run.
             capabilities: Additional ``CapabilityDescription`` objects to register as
                 callable sub-agents alongside the built-ins.
@@ -187,6 +191,7 @@ class DeepAgent:
 
         self.objective: str = objective
         self._max_steps: int = max_steps  # Max steps to prevent infinite loops
+        self.max_concurrent_tasks: int = max_concurrent_tasks
         self.token_budget: Union[int, None] = set_token_budget
         self.verbose = verbose_logging
         # self.output_type = output_type

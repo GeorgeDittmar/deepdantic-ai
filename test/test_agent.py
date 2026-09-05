@@ -77,6 +77,7 @@ def make_minimal_deep_agent(prompt: str = "obj") -> agent_mod.DeepAgent:
     # Core run() expectations
     da.objective = prompt
     da._max_steps = 3
+    da.max_concurrent_tasks = 4
     da.token_budget = None
     da.verbose = False
 
@@ -778,3 +779,153 @@ async def test_coerce_output_ingests_existing_file_as_artifact(
     assert tr.artifacts[0].uri.startswith("artifacts/")
     assert "file outputs ingested as artifacts" in tr.detailed_output.lower()
     assert "stars drift" in tr.detailed_output
+
+
+# ---------------------------------------------------------------------------
+# Test 1: Context overflow recovery
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_execute_retries_on_context_overflow():
+    """When an agent call raises a context-limit error, execute should
+    retry with a resume prompt (up to max_resume_attempts + 1 = 3 total tries).
+    """
+    runtime_state = RuntimeState(objective="obj", capability_registry={}, next_task_id=1)
+    da = make_minimal_deep_agent()
+
+    sub_agent = MagicMock(name="sub_agent")
+    sub_agent.run = AsyncMock(name="run")
+
+    # First call raises a context-limit error, second call succeeds.
+    ctx_err = RuntimeError("context length exceeded")
+    sub_agent.run.side_effect = [
+        ctx_err,
+        SimpleNamespace(output=TaskResult(task_id=1, summary="done")),
+    ]
+
+    step = TaskItem(
+        task_id=1,
+        overall_objective="obj",
+        sub_task_objective="do",
+        capability="worker_agent",
+        status=TaskStatus.READY,
+    )
+
+    result = await da.execute(sub_agent, step, runtime_state)
+
+    assert result.status == TaskStatus.NEEDS_REVIEW
+    assert result.result.summary == "done"
+    assert sub_agent.run.call_count == 2
+    assert "context_overflow" in result.metadata
+
+
+# ---------------------------------------------------------------------------
+# Test 2: Cascade cancellations
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cascade_cancellations_propagates_to_downstream():
+    """When an upstream task is CANCELLED, all downstream PENDING/READY
+    tasks depending on it must also be CANCELLED.
+    """
+    runtime_state = RuntimeState(
+        objective="obj", capability_registry={}, next_task_id=4
+    )
+    da = make_minimal_deep_agent()
+    da._checkpoint_recorder = DummyRecorder()
+
+    # Task 1 is cancelled, task 2 depends on 1, task 3 depends on 2
+    runtime_state.plan[1] = TaskItem(
+        task_id=1,
+        overall_objective="obj",
+        sub_task_objective="cancelled",
+        capability="worker_agent",
+        status=TaskStatus.CANCELLED,
+    )
+    runtime_state.plan[2] = TaskItem(
+        task_id=2,
+        overall_objective="obj",
+        sub_task_objective="blocked by 1",
+        capability="worker_agent",
+        status=TaskStatus.READY,
+        sub_task_dependencies=[1],
+    )
+    runtime_state.plan[3] = TaskItem(
+        task_id=3,
+        overall_objective="obj",
+        sub_task_objective="blocked by 2",
+        capability="worker_agent",
+        status=TaskStatus.PENDING,
+        sub_task_dependencies=[2],
+    )
+
+    await da._cascade_cancellations(runtime_state)
+
+    assert runtime_state.plan[2].status == TaskStatus.CANCELLED
+    assert runtime_state.plan[3].status == TaskStatus.CANCELLED
+    assert (
+        "Upstream dependency Task 1 was cancelled" in runtime_state.plan[2].error_msg
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 3: _select_final_result priority ordering
+# ---------------------------------------------------------------------------
+
+
+def test_select_final_result_priority_ordering(runtime_state: RuntimeState):
+    """_select_final_result should prefer in this order:
+    1) is_final=True task
+    2) task with detailed_output
+    3) producer_agent task
+    4) newest completed task
+    """
+    da = make_minimal_deep_agent()
+
+    # Producer with no detail
+    producer = TaskItem(
+        task_id=1,
+        overall_objective="obj",
+        sub_task_objective="synthesize",
+        capability="producer_agent",
+        status=TaskStatus.COMPLETED,
+        result=TaskResult(task_id=1, summary="producer output"),
+    )
+
+    # Task with detailed_output (higher ID)
+    detailed = TaskItem(
+        task_id=2,
+        overall_objective="obj",
+        sub_task_objective="detail",
+        capability="worker_agent",
+        status=TaskStatus.COMPLETED,
+        result=TaskResult(
+            task_id=2, summary="detail", detailed_output="substantive content here"
+        ),
+    )
+
+    runtime_state.plan = {1: producer, 2: detailed}
+
+    selected = da._select_final_result(runtime_state)
+    assert selected is detailed.result  # detailed_output beats producer
+
+    # Now add an is_final task (should win over detailed_output)
+    final = TaskItem(
+        task_id=3,
+        overall_objective="obj",
+        sub_task_objective="final",
+        capability="worker_agent",
+        status=TaskStatus.COMPLETED,
+        is_final=True,
+        result=TaskResult(task_id=3, summary="final"),
+    )
+    runtime_state.plan[3] = final
+
+    selected = da._select_final_result(runtime_state)
+    assert selected is final.result  # is_final beats detailed_output
+
+    # No completed tasks
+    runtime_state.plan = {}
+    assert da._select_final_result(runtime_state) is None
