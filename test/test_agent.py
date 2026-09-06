@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pydantask.agents.supervisor_tools import SupervisorTools
+
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -7,6 +9,7 @@ import pytest
 from httpx import AsyncClient
 
 import pydantask.agents.agent as agent_mod
+from pydantask.agents.scheduler import Scheduler
 from pydantask.tools import default_tools
 from pydantask.capabilities.runner_v2 import as_runner
 from pydantask.models import (
@@ -53,13 +56,18 @@ def env_vars(monkeypatch: pytest.MonkeyPatch):
 
 @pytest.fixture
 def runtime_state() -> RuntimeState:
-    return RuntimeState(objective="obj", capability_registry={}, next_task_id=1)
+    return RuntimeState(
+        objective="obj",
+        capability_registry={},
+        next_task_id=1,
+        plan_lock=DummyAsyncLock(),
+    )
 
 
 def make_minimal_deep_agent(prompt: str = "obj") -> agent_mod.DeepAgent:
-    """Create a DeepAgent without running its heavy __init__.
+    """Create a DeepAgent without running its heavy ``__init__``.
 
-    Since `__init__` is skipped, this function must define any attributes that
+    Since ``__init__`` is skipped, this function must define any attributes that
     methods under test expect to exist.
     """
     da = agent_mod.DeepAgent.__new__(agent_mod.DeepAgent)
@@ -89,6 +97,16 @@ def make_minimal_deep_agent(prompt: str = "obj") -> agent_mod.DeepAgent:
 
     # Misc
     da._retry_model = MagicMock()
+
+    # Supervisor tools (extracted) — needed for add_task/cancel_task/patch_task etc.
+    da._supervisor_tools = SupervisorTools(
+        context_resolver=lambda ctx: ctx.deps,
+    )
+
+    # Scheduler (extracted) — needed for _scheduler_pass, _dependencies_satisfied etc.
+    da._scheduler = Scheduler(
+        context_resolver=lambda ctx: ctx,
+    )
 
     return da
 
@@ -588,6 +606,7 @@ async def test_mark_final_task_sets_flag_and_emits_event(runtime_state: RuntimeS
     da = make_minimal_deep_agent(prompt="overall")
     recorder = DummyRecorder()
     da._checkpoint_recorder = recorder
+    runtime_state.checkpoint_recorder = recorder
 
     # Two tasks, mark the second as final.
     runtime_state.plan[1] = TaskItem(
@@ -655,13 +674,16 @@ async def test_scheduler_marks_callable_task_errored_when_missing_parameters(
     async def write_something_to_file(content: str, filename: str) -> str:
         return f"wrote {filename}"
 
-    da._capability_registry = {
+    caps = {
         "write_to_file": agent_mod.CapabilityDescription(
             name="write_to_file",
             description="",
             tool_func=as_runner(write_something_to_file),
         )
     }
+    # Set on both da and runtime_state so the scheduler can access it
+    da._capability_registry = caps
+    runtime_state.capability_registry = caps
 
     # Missing the required 'filename'
     runtime_state.plan[1] = TaskItem(

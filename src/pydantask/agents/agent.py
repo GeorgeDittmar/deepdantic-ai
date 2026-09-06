@@ -7,7 +7,6 @@ import re
 from httpx import AsyncClient, HTTPStatusError
 from tenacity import (
     wait_exponential,
-    retry,
     retry_if_exception_type,
     stop_after_attempt,
 )
@@ -17,9 +16,9 @@ from collections import Counter
 
 from loguru import logger
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from pydantic_ai import Agent, RunContext
-from typing import List, Optional, Literal, Any, Dict, Callable, Union, Type
+from typing import List, Optional, Literal, Any, Dict, Callable, Union
 from datetime import datetime
 from asyncio import TaskGroup
 from pydantask.capabilities.introspection import (
@@ -36,17 +35,12 @@ from pydantic_ai.common_tools.duckduckgo import duckduckgo_search_tool
 from pydantic_ai.usage import UsageLimits
 
 from pydantask.capabilities.runner_v2 import as_runner, CapabilityRunner
+from pydantask.agents.scheduler import Scheduler
+from pydantask.agents.supervisor_tools import SupervisorTools
 from pathlib import Path
 from pydantic_ai.models import Model
-from pydantic_ai.settings import ModelSettings
-
 from pydantask.prompts.prompts_v2 import (
-    CRITIC_SYS_PROMPT,
-    PRODUCER_SYS_PROMPT,
-    RESEARCH_AGENT_SYS_PROMPT,
     SUPERVISOR_INPUT_PROMPT,
-    WORKER_AGENT_SYS_PROMPT,
-    DYNAMIC_SUPERVISOR_SYS_PROMPT,
     BOOTSTRAP_INSTURCT,
     ORCHESTRATION_INSTRUCT,
     COMPRESSED_RESEARCH_SYS_PROMPT,
@@ -80,7 +74,6 @@ from pydantask.tools.default_tools import (
     list_completed_tasks,
     read_scratch_notes,
     think_tool,
-    read_file_contents
 )
 from pydantask.tools.artifact_tools import (
     put_artifact,
@@ -231,6 +224,16 @@ class DeepAgent:
             )
             self.checkpoint_path.mkdir(parents=True, exist_ok=True)
             self._checkpoint_recorder = CheckpointRecorder(self.checkpoint_path)
+
+        # Supervisor tools (extracted from this class for testability).
+        self._supervisor_tools = SupervisorTools(
+            context_resolver=lambda ctx: ctx.deps,
+        )
+
+        # Scheduler (extracted from this class for testability).
+        self._scheduler = Scheduler(
+            context_resolver=lambda ctx: ctx,
+        )
 
         # Build the shared model used by all sub-agents.
         # TODO: Future state allow for configuration of what models to use per capability
@@ -684,17 +687,17 @@ class DeepAgent:
         ``fixed`` mode the supervisor LLM cannot call ``add_task``/``patch_task``.
         """
         base_tools = [
-            self.update_task_status,
-            self.cancel_task,
-            self.view_qa_report,
+            self._supervisor_tools.update_task_status,
+            self._supervisor_tools.cancel_task,
+            self._supervisor_tools.view_qa_report,
             get_current_datetime,
             think_tool,
         ]
 
         mutating_tools = [
-            self.add_task,
-            self.patch_task,
-            self.mark_final_task,
+            self._supervisor_tools.add_task,
+            self._supervisor_tools.patch_task,
+            self._supervisor_tools.mark_final_task,
         ]
 
         if self.planning_mode == "fixed":
@@ -1584,81 +1587,28 @@ Instructions:
         metadata: dict | None = None,
         parameters: dict | None = None,
     ) -> int:
-        """Tool: Add Task.
-
-        Note: In ``planning_mode="fixed"`` this tool is not registered on the
-        supervisor agent, but it may still be called directly in Python.
-
-        Create and register a new ``TaskItem`` in the current plan/DAG when
-        more work is required to achieve the overall objective.
-
-        The supervisor should specify any upstream dependencies so that
-        execution order can be enforced.
-
-        Args:
-            ctx: ``RunContext`` carrying the current ``RuntimeState``.
-            sub_task_objective: Natural-language objective for the new task.
-            capability: Name of the capability / sub-agent that should execute
-                this task.
-            dependencies: Optional list of task IDs that must complete
-                successfully before this task can run.
-            metadata: Optional free-form metadata dictionary attached to the task.
-
-        Returns:
-            The integer ``task_id`` assigned to the newly created task.
-        """
+        """Tool: Add Task (delegates to :class:`Scheduler`)."""
         async with self._plan_lock:
-            plan = ctx.deps.plan
-            new_id = ctx.deps.next_task_id
-            ctx.deps.next_task_id += 1
-
-            task = TaskItem(
-                task_id=new_id,
-                overall_objective=ctx.deps.objective,
+            return await self._supervisor_tools.add_task(
+                ctx,
                 sub_task_objective=sub_task_objective,
                 capability=capability,
-                sub_task_dependencies=dependencies or [],
-                metadata=metadata or {},
-                parameters=parameters or {},
-                status=TaskStatus.READY,
+                dependencies=dependencies,
+                metadata=metadata,
+                parameters=parameters,
             )
-            plan[new_id] = task
-            await self._record_event(
-                "task_added",
-                {
-                    "task": task.model_dump(mode="json"),
-                    "next_task_id": ctx.deps.next_task_id,
-                },
-            )
-            return new_id
 
     async def cancel_task(
-        self, ctx: RunContext[RuntimeState], task_id: int, reason: str
-    ):
-        """Tool: Cancel Task.
-
-        Mark a task as ``CANCELLED`` when it is no longer relevant or when
-        a failure in an upstream dependency makes it impossible to complete.
-
-        Args:
-            ctx: ``RunContext`` carrying the current ``RuntimeState``.
-            task_id: Identifier of the task to cancel.
-            reason: Human-readable explanation for the cancellation.
-        """
+        self,
+        ctx: RunContext[RuntimeState],
+        task_id: int,
+        reason: str,
+    ) -> str:
+        """Tool: Cancel Task (delegates to :class:`Scheduler`)."""
         async with self._plan_lock:
-            if task_id in ctx.deps.plan:
-                task = ctx.deps.plan[task_id]
-                # Instead of deleting, mark as CANCELLED to keep history
-                task.status = TaskStatus.CANCELLED
-                task.error_msg = reason
-                await self._record_task_status_event(
-                    task_id,
-                    TaskStatus.CANCELLED,
-                    reason=reason,
-                    error_msg=reason,
-                )
-                return f"Task {task_id} cancelled. Reason: {reason}"
-            return f"Error: Task {task_id} not found."
+            return await self._supervisor_tools.cancel_task(
+                ctx, task_id=task_id, reason=reason
+            )
 
     async def patch_task(
         self,
@@ -1668,53 +1618,17 @@ Instructions:
         capability: Optional[str] = None,
         dependencies: Optional[List[int]] = None,
         parameters: dict | None = None,
-    ):
-        """Tool: Patch Task.
-
-        Note: In ``planning_mode="fixed"`` this tool is not registered on the
-        supervisor agent, but it may still be called directly in Python.
-
-        Update an existing task's objective and/or dependency list in-place.
-
-        Args:
-            ctx: ``RunContext`` carrying the current ``RuntimeState``.
-            task_id: Identifier of the task to modify.
-            sub_task_objective: New sub-task objective, if changing.
-            capability: New capability to use, if changing
-            dependencies: Updated list of dependency IDs, if changing.
-        """
+    ) -> str:
+        """Tool: Patch Task (delegates to :class:`Scheduler`)."""
         async with self._plan_lock:
-            task = ctx.deps.plan.get(task_id)
-            if not task:
-                return "Task not found."
-
-            payload: Dict[str, Any] = {"task_id": task_id}
-
-            if sub_task_objective:
-                task.sub_task_objective = sub_task_objective
-                payload["sub_task_objective"] = task.sub_task_objective
-            if dependencies is not None:
-                task.sub_task_dependencies = dependencies
-                payload["dependencies"] = task.sub_task_dependencies
-
-            if capability is not None:
-                task.capability = capability
-                payload["capability"] = task.capability
-
-            if parameters is not None:
-                if not isinstance(getattr(task, "parameters", None), dict):
-                    task.parameters = {}
-                if not isinstance(parameters, dict):
-                    return "Error: 'parameters' must be a dict."
-
-                # Merge semantics: patch updates keys in-place.
-                task.parameters.update(parameters)
-                payload["parameters"] = parameters
-
-            if len(payload) > 1:
-                await self._record_event("task_patched", payload)
-
-            return f"Task {task_id} updated successfully."
+            return await self._supervisor_tools.patch_task(
+                ctx,
+                task_id=task_id,
+                sub_task_objective=sub_task_objective,
+                capability=capability,
+                dependencies=dependencies,
+                parameters=parameters,
+            )
 
     async def mark_final_task(
         self,
@@ -1722,286 +1636,29 @@ Instructions:
         task_id: int,
         reason: str | None = None,
     ) -> str:
-        """Tool: Mark Final Task.
-
-        Mark exactly one task as the final deliverable for the run.
-
-        This tool should be called by the supervisor (planner/orchestrator), not
-        by workers. It enables deterministic "final_result" selection on resume.
-
-        The invariant enforced is: at most one task has `is_final=True`.
-        """
+        """Tool: Mark Final Task (delegates to :class:`Scheduler`)."""
         async with self._plan_lock:
-            if task_id not in ctx.deps.plan:
-                return f"Error: No task with id {task_id} found in plan."
-
-            for t in ctx.deps.plan.values():
-                t.is_final = False
-
-            ctx.deps.plan[task_id].is_final = True
-
-            payload: Dict[str, Any] = {"task_id": task_id}
-            if reason:
-                payload["reason"] = reason
-            await self._record_event("final_task_set", payload)
-
-            return f"Task {task_id} marked as final."
+            return await self._supervisor_tools.mark_final_task(
+                ctx, task_id=task_id, reason=reason
+            )
 
     def _is_terminal_status(self, status: TaskStatus) -> bool:
-        """Return True if a task is in a terminal state.
-
-        Note: ERRORED is intentionally treated as non-terminal; the supervisor
-        may still choose to patch the task and rerun it.
-        """
-        return status in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+        """Delegate to :class:`Scheduler.is_terminal_status`."""
+        return self._scheduler.is_terminal_status(status)
 
     async def _scheduler_pass(self, ctx: RuntimeState) -> str:
-        """Deterministic scheduler pass.
-
-        This pass performs small, non-LLM state normalization to improve autonomy:
-
-        - Promote PENDING -> READY when all dependencies are COMPLETED.
-        - Demote READY -> PENDING if dependencies are not satisfied (keeps the
-          status board honest).
-        - Mark tasks with unknown capability as ERRORED (unless terminal).
-
-        Returns a human-readable report injected into the next supervisor prompt.
-        """
-        changes: list[str] = []
-        warnings: list[str] = []
-
-        async with self._plan_lock:
-            for task_id, task in sorted(ctx.plan.items(), key=lambda kv: kv[0]):
-                # Unknown capability detection.
-                if task.capability and task.capability not in self._capability_registry:
-                    if not self._is_terminal_status(task.status):
-                        if task.status != TaskStatus.ERRORED:
-                            changes.append(
-                                f"- Task {task_id}: {task.status.value} -> errored (unknown capability: {task.capability!r})"
-                            )
-                            task.status = TaskStatus.ERRORED
-                            task.error_msg = f"Unknown capability: {task.capability!r}"
-                            await self._record_task_status_event(
-                                task_id,
-                                TaskStatus.ERRORED,
-                                reason="unknown capability",
-                                error_msg=task.error_msg,
-                            )
-                        else:
-                            task.error_msg = f"Unknown capability: {task.capability!r}"
-                    continue
-
-                # Deterministic callable input contract check.
-                # If a capability is a wrapped python callable, ensure required inputs
-                # are present in TaskItem.parameters before we ever schedule it.
-                cap_desc = (
-                    self._capability_registry.get(task.capability)
-                    if task.capability
-                    else None
-                )
-                func = (
-                    unwrap_callable(getattr(cap_desc, "tool_func", None))
-                    if cap_desc
-                    else None
-                )
-                if func is not None:
-                    schema = callable_input_schema(func)
-                    required = list(schema.get("required") or [])
-                    if required:
-                        params = getattr(task, "parameters", None)
-                        if not isinstance(params, dict):
-                            params = {}
-
-                        missing = [k for k in required if k not in params]
-
-                        # Self-heal: if the task was previously errored for missing parameters
-                        # and the supervisor has since patched them in, promote back to runnable.
-                        if (
-                            not missing
-                            and task.status == TaskStatus.ERRORED
-                            and task.metadata.get("errored_reason")
-                            == "missing_required_parameters"
-                        ):
-                            deps_ok_now = self._dependencies_satisfied(task, ctx)
-                            new_status = (
-                                TaskStatus.READY if deps_ok_now else TaskStatus.PENDING
-                            )
-                            changes.append(
-                                f"- Task {task_id}: errored -> {new_status.value} (required parameters supplied)"
-                            )
-                            task.status = new_status
-                            task.error_msg = None
-                            # Clear prior missing-parameter markers.
-                            task.metadata.pop("missing_parameters", None)
-                            task.metadata.pop("errored_reason", None)
-                            await self._record_task_status_event(
-                                task_id,
-                                new_status,
-                                reason="required_parameters_supplied",
-                            )
-
-                        if missing and task.status in {
-                            TaskStatus.PENDING,
-                            TaskStatus.READY,
-                            TaskStatus.RERUN,
-                        }:
-                            msg = (
-                                "Missing required parameters for callable capability "
-                                f"{task.capability!r}: missing={missing}; required={required}. "
-                                "Supervisor must patch the task with parameters={...}."
-                            )
-                            changes.append(
-                                f"- Task {task_id}: {task.status.value} -> errored (missing required parameters: {missing})"
-                            )
-                            task.status = TaskStatus.ERRORED
-                            task.error_msg = msg
-                            task.metadata["missing_parameters"] = missing
-                            task.metadata["errored_reason"] = "missing_required_parameters"
-                            await self._record_task_status_event(
-                                task_id,
-                                TaskStatus.ERRORED,
-                                reason="missing_required_parameters",
-                                error_msg=msg,
-                            )
-                            continue
-
-                # Dependency-based readiness propagation.
-                deps_ok = self._dependencies_satisfied(task, ctx)
-
-                if task.status == TaskStatus.PENDING and deps_ok:
-                    task.status = TaskStatus.READY
-                    changes.append(
-                        f"- Task {task_id}: pending -> ready (deps satisfied)"
-                    )
-                    await self._record_task_status_event(
-                        task_id,
-                        TaskStatus.READY,
-                        reason="dependencies_satisfied",
-                    )
-
-                # Keep READY tasks honest if deps are not actually satisfied.
-                if task.status == TaskStatus.READY and not deps_ok:
-                    task.status = TaskStatus.PENDING
-                    changes.append(
-                        f"- Task {task_id}: ready -> pending (deps not satisfied)"
-                    )
-                    await self._record_task_status_event(
-                        task_id,
-                        TaskStatus.PENDING,
-                        reason="dependencies_not_met",
-                    )
-
-        if not changes and not warnings:
-            return "No scheduler changes this cycle."
-
-        out: list[str] = []
-        if changes:
-            out.append("Status normalization:")
-            out.extend(changes)
-        if warnings:
-            out.append("Warnings:")
-            out.extend(warnings)
-        return "\n".join(out)
+        """Delegate to :class:`Scheduler.scheduler_pass`."""
+        return await self._scheduler.scheduler_pass(ctx)
 
     def _select_final_result(self, runtime_state: RuntimeState) -> TaskResult | None:
-        """Select the run's final output deterministically.
-
-        Priority:
-        1) A COMPLETED task with `is_final=True`.
-        2) A COMPLETED task with non-empty `result.detailed_output`.
-        3) A COMPLETED `producer_agent` task.
-        4) Otherwise the newest COMPLETED task with any result.
-
-        This ensures checkpoint resume returns a stable final deliverable even
-        if the supervisor immediately declares completion.
-        """
-        completed: list[TaskItem] = [
-            t
-            for t in runtime_state.plan.values()
-            if t.status == TaskStatus.COMPLETED and t.result is not None
-        ]
-        if not completed:
-            return None
-
-        finals = [t for t in completed if getattr(t, "is_final", False)]
-        if finals:
-            return max(finals, key=lambda t: t.task_id).result
-
-        with_detail = [
-            t
-            for t in completed
-            if (t.result and (t.result.detailed_output or "").strip())
-        ]
-        if with_detail:
-            return max(with_detail, key=lambda t: t.task_id).result
-
-        producers = [t for t in completed if t.capability == "producer_agent"]
-        if producers:
-            return max(producers, key=lambda t: t.task_id).result
-
-        return max(completed, key=lambda t: t.task_id).result
+        """Delegate to :class:`Scheduler.select_final_result`."""
+        return self._scheduler.select_final_result(runtime_state)
 
     def _build_deadlock_report(
         self, ctx: RuntimeState, decision: SupervisorDecision | None = None
     ) -> str:
-        """Explain why no tasks ran in the current cycle."""
-
-        status_counts = Counter(t.status.value for t in ctx.plan.values())
-        runnable: list[int] = []
-        blocked: list[str] = []
-
-        for task_id, task in sorted(ctx.plan.items(), key=lambda kv: kv[0]):
-            if self._is_terminal_status(task.status):
-                continue
-
-            if task.status in {
-                TaskStatus.READY,
-                TaskStatus.RERUN,
-            } and self._dependencies_satisfied(task, ctx):
-                runnable.append(task_id)
-                continue
-
-            # Compute a human-readable reason.
-            if task.capability not in self._capability_registry:
-                blocked.append(
-                    f"- Task {task_id} [{task.status.value}]: unknown capability {task.capability!r}"
-                )
-                continue
-
-            if task.sub_task_dependencies:
-                missing = [d for d in task.sub_task_dependencies if d not in ctx.plan]
-                if missing:
-                    blocked.append(
-                        f"- Task {task_id} [{task.status.value}]: missing deps {missing}"
-                    )
-                    continue
-
-                unmet = [
-                    d
-                    for d in task.sub_task_dependencies
-                    if ctx.plan.get(d) is not None
-                    and ctx.plan[d].status != TaskStatus.COMPLETED
-                ]
-                if unmet:
-                    blocked.append(
-                        f"- Task {task_id} [{task.status.value}]: waiting on deps {unmet}"
-                    )
-                    continue
-
-            blocked.append(f"- Task {task_id} [{task.status.value}]: not runnable")
-
-        lines: list[str] = []
-        lines.append("Deadlock / no-progress report:")
-        lines.append(f"- status_counts: {dict(status_counts)}")
-        if decision is not None:
-            lines.append(f"- supervisor_requested: {decision.tasks_to_execute or []}")
-        lines.append(f"- runnable_now: {runnable}")
-        if blocked:
-            lines.append("- blocked_examples:")
-            # keep this short to avoid prompt bloat
-            lines.extend(blocked[:12])
-
-        return "\n".join(lines)
+        """Delegate to :class:`Scheduler.build_deadlock_report`."""
+        return self._scheduler.build_deadlock_report(ctx, decision)
 
     @traced()
     async def run(self) -> PydanTaskRunResult:
@@ -2225,84 +1882,16 @@ Instructions:
         return return_result
 
     def _apply_seed_plan(self, runtime_state: RuntimeState) -> None:
-        """Seed ``runtime_state.plan`` from ``self.seed_plan`` (if provided).
-
-        This is used to support user-specified plans. It validates:
-
-        * Unique task IDs.
-        * Dependencies refer to existing tasks.
-
-        It also updates ``runtime_state.next_task_id``.
-        """
-        if self.seed_plan is None:
-            return
-
-        tasks = list(self.seed_plan.tasks or [])
-        if not tasks:
-            return
-
-        plan_dict: dict[int, TaskItem] = {}
-        for t in tasks:
-            if t.task_id in plan_dict:
-                raise ValueError(f"Duplicate task_id in seed_plan: {t.task_id}")
-            # Ensure the overall objective is consistent.
-            if not getattr(t, "overall_objective", None):
-                t.overall_objective = runtime_state.objective
-            plan_dict[t.task_id] = t
-
-        for t in plan_dict.values():
-            for dep_id in t.sub_task_dependencies or []:
-                if dep_id not in plan_dict:
-                    raise ValueError(
-                        f"seed_plan task {t.task_id} depends on missing task {dep_id}"
-                    )
-
-        runtime_state.plan = plan_dict
-        runtime_state.next_task_id = max(plan_dict.keys()) + 1
+        """Delegate to :class:`Scheduler.apply_seed_plan`."""
+        self._scheduler.apply_seed_plan(runtime_state, self.seed_plan)
 
     def _dependencies_satisfied(self, step: TaskItem, ctx: RuntimeState) -> bool:
-        """Return ``True`` if all of a task's dependencies are fully satisfied.
+        """Delegate to :class:`Scheduler.dependencies_satisfied`."""
+        return self._scheduler.dependencies_satisfied(step, ctx)
 
-        Currently a dependency is considered satisfied only if the dependent
-        task exists and is in the ``COMPLETED`` state.
-        """
-        # Consider a dependency satisfied only if it's COMPLETED (or whatever set you like)
-        required_statuses = {TaskStatus.COMPLETED}
-        for dep_id in step.sub_task_dependencies or []:
-            dep_task = ctx.plan.get(dep_id)
-            if dep_task is None:
-                # Be conservative: if the dependency is missing, treat it as unsatisfied
-                return False
-            if dep_task.status not in required_statuses:
-                return False
-        return True
-
-    async def _cascade_cancellations(self, ctx: RuntimeState):
-        """Transitively marks downstream tasks as CANCELLED if they rely
-        on an upstream task that has been cancelled.
-        """
-        async with self._plan_lock:
-            changed = True
-            while changed:
-                changed = False
-                for task in ctx.plan.values():
-                    # We only care about steps waiting to run or currently eligible
-                    if task.status in {TaskStatus.PENDING, TaskStatus.READY}:
-                        for dep_id in task.sub_task_dependencies or []:
-                            dep_task = ctx.plan.get(dep_id)
-                            if dep_task and dep_task.status == TaskStatus.CANCELLED:
-                                task.status = TaskStatus.CANCELLED
-                                task.error_msg = (
-                                    f"Upstream dependency Task {dep_id} was cancelled."
-                                )
-                                await self._record_task_status_event(
-                                    task.task_id,
-                                    TaskStatus.CANCELLED,
-                                    reason=f"Upstream task {dep_id} cancelled; dropping downstream branch.",
-                                    error_msg=task.error_msg,
-                                )
-                                changed = True
-                                break
+    async def _cascade_cancellations(self, ctx: RuntimeState) -> None:
+        """Delegate to :class:`Scheduler.cascade_cancellations`."""
+        await self._scheduler.cascade_cancellations(ctx)
 
     @traced(capture_input=False)
     async def _execute_ready_tasks(
@@ -2598,27 +2187,16 @@ Context-budget note:
         return step
 
     async def update_task_status(
-        self, ctx: RunContext[RuntimeState], task_id: int, status: TaskStatus
-    ):
-        """Tool: Update Task Status.
-
-        Primarily used by the supervisor to transition a task between states
-        (e.g. to ``READY`` or ``COMPLETED``) once dependencies are met or QA
-        has passed.
-
-        Args:
-            ctx: ``RunContext`` carrying the current ``RuntimeState``.
-            task_id: Identifier of the task to update.
-            status: New :class:`TaskStatus` value for the task.
-        """
+        self,
+        ctx: RunContext[RuntimeState],
+        task_id: int,
+        status: TaskStatus,
+    ) -> str:
+        """Tool: Update Task Status (delegates to :class:`Scheduler`)."""
         async with self._plan_lock:
-            if task_id in ctx.deps.plan:
-                task = ctx.deps.plan.get(task_id)
-                if task is not None:
-                    task.status = status
-                    await self._record_task_status_event(task_id, status)
-                return f"Status for {task_id} is now {status}."
-            return f"Error: No task with {task_id} found in plan. Be sure task_id actually exists."
+            return await self._supervisor_tools.update_task_status(
+                ctx, task_id=task_id, status=status
+            )
 
     async def handle_critic_result(self, task: TaskItem, review: TaskQAResult):
         """Apply the critic's QA result to a task and emit checkpoint events."""
@@ -2662,33 +2240,11 @@ Context-budget note:
             },
         )
 
-    async def view_qa_report(self, ctx: RunContext[RuntimeState], task_id: int) -> str:
-        """Tool: View QA Report.
-
-        Return the full serialized QA report for a specific task, if one is
-        available. This is typically called by the supervisor when additional
-        inspection of the critic's reasoning is required.
-
-        Args:
-            ctx: ``RunContext`` carrying the current ``RuntimeState``.
-            task_id: Identifier of the task whose QA report should be viewed.
-
-        Returns:
-            A JSON-formatted string representation of the stored
-            :class:`TaskQAResult`, or a message describing why no report is
-            available.
-        """
+    async def view_qa_report(
+        self, ctx: RunContext[RuntimeState], task_id: int
+    ) -> str:
+        """Tool: View QA Report (delegates to :class:`Scheduler`)."""
         async with self._plan_lock:
-            task = ctx.deps.plan.get(task_id)
-            logger.info(f"Checking QA Report for task: {task_id}")
-            if task is None:
-                return f"No task with id {task_id}."
-
-            fb = getattr(task, "task_feedback", None)
-            if fb is None:
-                return f"No QA feedback found for task {task_id}."
-            task.metadata.setdefault("qa", {})
-            task.metadata["qa"]["report_viewed"] = True
-
-            # Return either a summary or full JSON depending on your needs
-            return fb.model_dump_json(indent=2)
+            return await self._supervisor_tools.view_qa_report(
+                ctx, task_id=task_id
+            )
