@@ -831,7 +831,7 @@ async def test_cascade_cancellations_propagates_to_downstream():
     tasks depending on it must also be CANCELLED.
     """
     runtime_state = RuntimeState(
-        objective="obj", capability_registry={}, next_task_id=4
+        objective="obj", capability_registry={}, next_task_id=4, plan_lock=DummyAsyncLock()
     )
     da = make_minimal_deep_agent()
     da._checkpoint_recorder = DummyRecorder()
