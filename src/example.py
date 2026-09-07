@@ -8,7 +8,11 @@ import asyncio
 
 load_dotenv(find_dotenv())
 
+<<<<<<< Updated upstream
 checkpoint_dir = Path("_checkpoint") / "primative"
+=======
+checkpoint_dir = Path("_checkpoint") / "report_test_2"
+>>>>>>> Stashed changes
 
 async def write_to_file(content:str, filename:str) -> str:
 
@@ -39,12 +43,19 @@ da = DeepAgent(
     # Finally take the song and whichever research topic passed the conditional check and combine them into a single output in song form. Jsut have the song do not let the producer agent output anything else with its task.
     # Again this is a test to see how well you follow creating a plan.""",
     # "Research for me `pydantask` harness. It is a python project. Give me a report on what it is, what problem does it try to solve, its features, and an example usage. As well include a bio summary on the main author of the harness. Write this up in markdown format and be sure to cite your sources.",
+<<<<<<< Updated upstream
     "Write a short story about scifi space travel. This should be saved to a file. Next take the contents of that file and pass it as inputs to another file I want you to write but translated to German.",
+=======
+    "Write me a report on harness engineering vs loop engineering for agent workflows.",
+>>>>>>> Stashed changes
     model="gpt-5.4",
     trace=True,
     max_steps=10,
     default_capabilities_enabled=True,
+<<<<<<< Updated upstream
     # capabilities=[writing_capability, reading_capability],
+=======
+>>>>>>> Stashed changes
     checkpoint=True,
     checkpoint_dir=checkpoint_dir,
 )
