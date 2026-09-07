@@ -1777,7 +1777,6 @@ Instructions:
         return await self._executor.execute_ready_tasks(tasks, ctx, self._plan_lock)
 
     @traced(run_type="task", capture_input=False)
-    @traced(run_type="task", capture_input=False)
     async def execute(
         self, capability: CapabilityRunner, step: TaskItem, runtime_state: RuntimeState
     ) -> TaskItem:
