@@ -10,6 +10,8 @@ from httpx import AsyncClient
 
 import pydantask.agents.agent as agent_mod
 from pydantask.agents.scheduler import Scheduler
+from pydantask.agents.executor import TaskExecutor
+from pydantask.agents.critic_handler import CriticHandler
 from pydantask.tools import default_tools
 from pydantask.capabilities.runner_v2 import as_runner
 from pydantask.models import (
@@ -106,6 +108,30 @@ def make_minimal_deep_agent(prompt: str = "obj") -> agent_mod.DeepAgent:
     # Scheduler (extracted) — needed for _scheduler_pass, _dependencies_satisfied etc.
     da._scheduler = Scheduler(
         context_resolver=lambda ctx: ctx,
+    )
+
+    # Task executor (extracted) — needed for execute_ready_tasks, execute, etc.
+    async def _async_coerce_output(step, output, *, runtime_state=None):
+        return output
+
+    da._executor = TaskExecutor(
+        context_resolver=lambda ctx: ctx,
+        capability_registry={},
+        record_event_cb=AsyncMock(),
+        record_task_status_event_cb=AsyncMock(),
+        record_metadata_append_cb=AsyncMock(),
+        coerce_output_cb=_async_coerce_output,
+        record_task_result_cb=AsyncMock(),
+    )
+    da._executor._cascade_cancellations_cb = AsyncMock()
+    da._executor._run_task_cb = (
+        lambda capability, step, ctx: da.execute(capability, step, ctx)
+    )
+
+    # Critic handler (extracted) — needed for handle_critic_result
+    da._critic_handler = CriticHandler(
+        record_event_cb=AsyncMock(),
+        record_task_status_event_cb=AsyncMock(),
     )
 
     return da
@@ -343,6 +369,9 @@ async def test_execute_ready_tasks_filters_deps_and_injects_feedback(
             tool_func=worker_impl,
         )
     }
+    # Sync executor's registry (fixture passes {} since da._capability_registry
+    # doesn't exist yet at fixture construction time)
+    da._executor._capability_registry = da._capability_registry
 
     async def _execute_side_effect(sub_agent, step: TaskItem, ctx: RuntimeState):
         # mimic DeepAgent.execute returning the (mutated) step
