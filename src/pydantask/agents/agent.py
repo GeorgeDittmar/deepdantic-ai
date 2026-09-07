@@ -37,6 +37,7 @@ from pydantask.capabilities.runner_v2 import as_runner, CapabilityRunner
 from pydantask.agents.scheduler import Scheduler
 from pydantask.agents.supervisor_tools import SupervisorTools
 from pydantask.agents.executor import TaskExecutor
+from pydantask.agents.critic_handler import CriticHandler
 from pathlib import Path
 from pydantic_ai.models import Model
 from pydantask.prompts.prompts_v2 import (
@@ -278,6 +279,12 @@ class DeepAgent:
         # Wire run_task_cb using a lambda so test mocks on da.execute are picked up.
         self._executor._run_task_cb = (
             lambda capability, step, ctx: self.execute(capability, step, ctx)
+        )
+
+        # Critic handler (extracted for testability).
+        self._critic_handler = CriticHandler(
+            record_event_cb=self._record_event,
+            record_task_status_event_cb=self._record_task_status_event,
         )
 
         self._critic_agent = Agent(
@@ -1790,46 +1797,8 @@ Instructions:
             )
 
     async def handle_critic_result(self, task: TaskItem, review: TaskQAResult):
-        """Apply the critic's QA result to a task and emit checkpoint events."""
-        task.attempt_count += 1
-        task.task_feedback = review
-
-        await self._record_event(
-            "critic_feedback",
-            {
-                "task_id": task.task_id,
-                "feedback": review.model_dump(mode="json"),
-                "attempt_count": task.attempt_count,
-            },
-        )
-
-        if review.passed:
-            task.status = TaskStatus.COMPLETED
-            task.error_msg = None
-            await self._record_task_status_event(task.task_id, task.status)
-            return
-
-        if task.attempt_count >= task.max_attempts:
-            task.status = TaskStatus.FAILED
-            task.error_msg = (
-                f"Max retries reached ({task.attempt_count}/{task.max_attempts})."
-            )
-            await self._record_task_status_event(
-                task.task_id, task.status, error_msg=task.error_msg
-            )
-            return
-
-        task.status = TaskStatus.RERUN
-        task.error_msg = None
-        task.sub_task_objective = f"{task.sub_task_objective}\n\nPrevious attempt failed review; feedback: {review.reasoning}"
-        await self._record_task_status_event(task.task_id, task.status)
-        await self._record_event(
-            "task_patched",
-            {
-                "task_id": task.task_id,
-                "sub_task_objective": task.sub_task_objective,
-            },
-        )
+        """Delegate to :class:`CriticHandler.handle_critic_result`."""
+        return await self._critic_handler.handle_critic_result(task, review)
 
     async def view_qa_report(
         self, ctx: RunContext[RuntimeState], task_id: int
