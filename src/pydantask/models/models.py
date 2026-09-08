@@ -55,7 +55,7 @@ class TaskQAResult(BaseModel):
     )
     reasoning: str = Field(
         default="",
-        description="Detailed explanation of how the result was judged, why it god the score that it did and feedback for supervisor to attempt a retry.",
+        description="Detailed explanation of how the result was judged, why it got the score that it did and feedback for supervisor to attempt a retry.",
     )
 
     passed: bool = Field(
@@ -466,6 +466,42 @@ class RuntimeState(BaseModel):
         description="Optional recorder used for event-sourced checkpointing.",
         exclude=True,
     )
+
+    # ------------------------------------------------------------------
+    # Concurrency — shared lock protecting plan mutations.
+    # ------------------------------------------------------------------
+
+    plan_lock: Any | None = Field(
+        default=None,
+        description="Optional asyncio.Lock protecting plan mutations.",
+        exclude=True,
+    )
+
+    # ------------------------------------------------------------------
+    # Checkpoint delegation — allows supervisor tools to record events
+    # without depending on the checkpointing subsystem directly.
+    # ------------------------------------------------------------------
+
+    async def record_event(self, event_type: str, payload: Dict[str, Any]) -> None:
+        """Delegate to the checkpoint recorder's ``record`` method."""
+        if self.checkpoint_recorder is not None:
+            await self.checkpoint_recorder.record(event_type, payload)
+
+    async def record_task_status_event(
+        self,
+        task_id: int,
+        status: "TaskStatus",
+        *,
+        reason: str | None = None,
+        error_msg: str | None = None,
+    ) -> None:
+        """Delegate to the checkpoint recorder's ``record_task_status_event`` method."""
+        payload: Dict[str, Any] = {"task_id": task_id, "status": status.value}
+        if reason:
+            payload["reason"] = reason
+        if error_msg:
+            payload["error_msg"] = error_msg
+        await self.record_event("task_status_updated", payload)
 
 
 class SupervisorDecision(BaseModel):
